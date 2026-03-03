@@ -3,11 +3,17 @@ title: CLI Tools Overview
 description: Command-line tools for managing MX8 data pipelines
 ---
 
-MX8 provides three core CLI tools for deploying and monitoring distributed data pipelines:
+MX8 provides several CLI tools for deploying and monitoring distributed data pipelines:
 
+**Core runtime tools:**
 - **mx8-coordinator**: Control plane server that manages leases, dataset ownership, and job coordination
 - **mx8d-agent**: Worker process that runs on each node to execute data pipeline tasks
 - **mx8-tui**: Terminal UI for monitoring live job state and diagnosing issues
+
+**Dataset utilities:**
+- **mx8-pack-s3**: Packs many small S3 objects into MX8 tar shards with canonical manifest
+- **mx8-snapshot-resolve**: Resolves dataset links to pinned snapshots and prints manifest hash
+- **mx8-seed-s3**: Uploads local files to S3 (used for testing and seeding data)
 
 ## Architecture
 
@@ -111,6 +117,64 @@ Run the readiness suite before new deployments:
 ```bash
 ./scripts/prod_readiness.sh
 ```
+
+## Dataset Utility Tools
+
+MX8 provides additional CLI utilities for dataset management and snapshot resolution.
+
+### mx8-pack-s3
+
+Packs many small S3 objects into MX8 tar shards and writes a canonical manifest. Run this once on a raw dataset prefix to produce a packed dataset that MX8 can load efficiently without large S3 LIST operations.
+
+```bash
+cargo run -p mx8-snapshot --features s3 --bin mx8-pack-s3 -- \
+  --pack-in 's3://my-bucket/raw/train/' \
+  --pack-out 's3://my-bucket/mx8/train/'
+```
+
+**Key arguments:**
+- `--pack-in` / `MX8_PACK_IN`: S3 input prefix (required)
+- `--pack-out` / `MX8_PACK_OUT`: S3 output prefix (required)
+- `--shard-mb` / `MX8_PACK_SHARD_MB`: Target shard size in MiB (default: 512)
+- `--label-mode` / `MX8_S3_LABEL_MODE`: `auto`, `none`, or `imagefolder` (default: auto)
+
+On success, prints: `samples=<n> shards=<n> manifest_key=<key> manifest_hash=<sha256>`
+
+### mx8-snapshot-resolve
+
+Resolves a dataset link to a pinned snapshot and prints the manifest hash. Useful for pre-pinning a snapshot before a job starts.
+
+```bash
+cargo run -p mx8-snapshot --features s3 --bin mx8-snapshot-resolve -- \
+  --dataset-link 's3://my-bucket/mx8/train/@refresh' \
+  --manifest-store-root '~/.mx8/manifests'
+```
+
+**Key arguments:**
+- `--dataset-link` / `MX8_DATASET_LINK`: Plain path, `@refresh`, or `@sha256:<hash>` (required)
+- `--manifest-store-root` / `MX8_MANIFEST_STORE_ROOT`: Filesystem path or S3 prefix (default: `~/.mx8/manifests`)
+
+On success, prints: `manifest_hash: <sha256>`
+
+### mx8-seed-s3
+
+Uploads a local file as a single S3 object. Used by deterministic local gates to seed test data into MinIO before running a gate.
+
+```bash
+cargo run -p mx8-runtime --features s3 --bin mx8-seed-s3 -- \
+  --bucket mx8-demo \
+  --key data.bin \
+  --file ./data.bin
+```
+
+**Key arguments:**
+- `--bucket` / `MX8_MINIO_BUCKET`: Destination bucket (default: mx8-demo)
+- `--key` / `MX8_MINIO_KEY`: Destination object key (default: data.bin)
+- `--file` / `MX8_SEED_FILE`: Local file path to upload (required)
+
+<Note>
+These utilities are typically used during dataset preparation, not during runtime. For Python-based packing, use `mx8.pack()` or `mx8.pack_dir()` instead.
+</Note>
 
 ## Next Steps
 
