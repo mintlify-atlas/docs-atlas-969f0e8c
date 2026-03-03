@@ -1,0 +1,447 @@
+---
+title: Checkpoint & Resume
+description: Save and restore training progress
+---
+
+MX8 loaders support checkpoint/resume to save training progress and restart from the exact position after interruption.
+
+## loader.checkpoint
+
+All loaders expose a `checkpoint()` method that returns an opaque token.
+
+```python
+token = loader.checkpoint()
+```
+
+### Returns
+
+<ResponseField name="token" type="bytes">
+  Opaque checkpoint token. Store alongside model checkpoint.
+</ResponseField>
+
+### Example
+
+```python
+import mx8
+
+loader = mx8.load(
+    "s3://bucket/dataset/",
+    batch_size_samples=64,
+    max_ram_gb=12,
+)
+
+for step, batch in enumerate(loader):
+    train_step(batch)
+    
+    # Checkpoint every 1000 steps
+    if step % 1000 == 0:
+        token = loader.checkpoint()
+        save_checkpoint({
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "mx8_token": token,
+            "step": step,
+        })
+```
+
+---
+
+## Resume from Checkpoint
+
+Pass the checkpoint token to `resume_from` when creating a loader.
+
+```python
+loader = mx8.load(
+    dataset_link,
+    batch_size_samples=64,
+    max_ram_gb=12,
+    resume_from=token,
+)
+```
+
+### Validation
+
+Checkpoint tokens are strictly validated:
+- `manifest_hash` must match
+- `schema_version` must match
+- `epoch` must match
+- `end_id` must match (if range loading)
+
+If validation fails, MX8 raises an error.
+
+### Example: Full Resume Flow
+
+```python
+import mx8
+import os
+from pathlib import Path
+
+dataset = "s3://bucket/train@refresh"
+checkpoint_path = Path("checkpoint.pt")
+
+# Pin manifest for consistent snapshot
+manifest_hash = mx8.resolve_manifest_hash(dataset)
+pinned = f"s3://bucket/train@sha256:{manifest_hash}"
+
+# Resume if checkpoint exists
+resume_token = None
+start_step = 0
+if checkpoint_path.exists():
+    ckpt = load_checkpoint(checkpoint_path)
+    model.load_state_dict(ckpt["model"])
+    optimizer.load_state_dict(ckpt["optimizer"])
+    resume_token = ckpt["mx8_token"]
+    start_step = ckpt["step"] + 1
+    print(f"Resuming from step {start_step}")
+
+# Create loader with resume token
+loader = mx8.load(
+    pinned,
+    batch_size_samples=64,
+    max_ram_gb=12,
+    resume_from=resume_token,
+)
+
+# Training loop
+for step, batch in enumerate(loader, start=start_step):
+    train_step(batch)
+    
+    if step % 1000 == 0:
+        token = loader.checkpoint()
+        save_checkpoint({
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "mx8_token": token,
+            "step": step,
+        }, checkpoint_path)
+```
+
+---
+
+## Distributed Resume
+
+Distributed loaders also support checkpoint/resume. All ranks must pass the same token on restart.
+
+```python
+import mx8
+
+# Capture phase
+loader = mx8.DistributedDataLoader(
+    coord_url="http://coordinator:50051",
+    job_id="train",
+    node_id=f"rank{rank}",
+    batch_size_samples=512,
+    max_ram_gb=24,
+)
+
+for step, batch in enumerate(loader):
+    train_step(batch)
+    
+    if step == 100:
+        token = loader.checkpoint()
+        save_checkpoint({"mx8_token": token, "step": step})
+        break
+
+loader.close()
+
+# Resume phase
+ckpt = load_checkpoint()
+token = ckpt["mx8_token"]
+
+loader = mx8.DistributedDataLoader(
+    coord_url="http://coordinator:50051",
+    job_id="train",
+    node_id=f"rank{rank}",
+    batch_size_samples=512,
+    max_ram_gb=24,
+    resume_from=token,  # All ranks pass same token
+)
+
+for step, batch in enumerate(loader, start=ckpt["step"] + 1):
+    train_step(batch)
+```
+
+### Distributed Resume Rules
+
+1. `resume_from` must be produced by `DistributedDataLoader.checkpoint()` from the same `manifest_hash` and `epoch`
+2. All ranks must pass the same token content (conflicting tokens are rejected)
+3. `resume_from` is a startup input only (late resume tokens after lease issuance are rejected)
+4. The token is opaque and versioned by MX8 (treat as byte blob)
+
+---
+
+## Mix Resume
+
+Mixed loaders support checkpoint/resume with per-source tracking.
+
+```python
+import mx8
+
+loader_a = mx8.load("s3://bucket/a/", batch_size_samples=32, max_ram_gb=6)
+loader_b = mx8.load("s3://bucket/b/", batch_size_samples=32, max_ram_gb=6)
+
+mixed = mx8.mix(
+    [loader_a, loader_b],
+    weights=[0.7, 0.3],
+    seed=17,
+    epoch=0,
+    max_ram_gb=12,
+)
+
+# Save checkpoint
+token = mixed.checkpoint()
+save_checkpoint({"mx8_token": token})
+
+# Resume
+ckpt = load_checkpoint()
+token = ckpt["mx8_token"]
+
+loader_a = mx8.load("s3://bucket/a/", batch_size_samples=32, max_ram_gb=6)
+loader_b = mx8.load("s3://bucket/b/", batch_size_samples=32, max_ram_gb=6)
+
+mixed = mx8.mix(
+    [loader_a, loader_b],
+    weights=[0.7, 0.3],
+    seed=17,
+    epoch=0,
+    max_ram_gb=12,
+    resume_from=token,
+)
+```
+
+### Mix Resume Contract
+
+- `seed`, `epoch`, and source count must match
+- Mix token restores scheduler position and per-source delivery counters
+- If source checkpoints differ, MX8 continues in best-effort mode and increments `mix_resume_source_checkpoint_mismatch_total` in stats
+
+---
+
+## Loader-Specific Resume
+
+All specialized loaders support checkpoint/resume:
+
+### Text Loader
+
+```python
+loader = mx8.text(
+    "s3://bucket/corpus/",
+    tokenizer="gpt2",
+    sequence_length=2048,
+    stride=2048,
+    batch_size_samples=32,
+    max_ram_gb=12,
+)
+
+token = loader.checkpoint()
+
+# Resume
+loader = mx8.text(
+    "s3://bucket/corpus/",
+    tokenizer="gpt2",
+    sequence_length=2048,
+    stride=2048,
+    batch_size_samples=32,
+    max_ram_gb=12,
+    resume_from=token,
+)
+```
+
+### Image Loader
+
+```python
+loader = mx8.image(
+    "s3://bucket/images/",
+    augment="imagenet",
+    batch_size_samples=64,
+    max_ram_gb=12,
+    seed=42,
+    epoch=0,
+)
+
+token = loader.checkpoint()
+
+# Resume
+loader = mx8.image(
+    "s3://bucket/images/",
+    augment="imagenet",
+    batch_size_samples=64,
+    max_ram_gb=12,
+    seed=42,
+    epoch=0,
+    resume_from=token,
+)
+```
+
+### Audio Loader
+
+```python
+loader = mx8.audio(
+    "s3://bucket/audio/",
+    batch_size_samples=32,
+    sample_count=16000,
+    channels=1,
+    max_ram_gb=12,
+)
+
+token = loader.checkpoint()
+
+# Resume
+loader = mx8.audio(
+    "s3://bucket/audio/",
+    batch_size_samples=32,
+    sample_count=16000,
+    channels=1,
+    max_ram_gb=12,
+    resume_from=token,
+)
+```
+
+### Video Loader
+
+```python
+loader = mx8.video(
+    "s3://bucket/videos/",
+    clip_len=16,
+    stride=8,
+    fps=8,
+    batch_size_samples=32,
+    max_ram_gb=12,
+)
+
+token = loader.checkpoint()
+
+# Resume
+loader = mx8.video(
+    "s3://bucket/videos/",
+    clip_len=16,
+    stride=8,
+    fps=8,
+    batch_size_samples=32,
+    max_ram_gb=12,
+    resume_from=token,
+)
+```
+
+---
+
+## Best Practices
+
+### 1. Pin Manifest Hash
+
+Always pin the manifest hash before multi-epoch training to ensure checkpoint tokens remain valid:
+
+```python
+manifest_hash = mx8.resolve_manifest_hash("s3://bucket/data@refresh")
+pinned = f"s3://bucket/data@sha256:{manifest_hash}"
+
+# Use pinned for all epochs and resume
+loader = mx8.load(pinned, resume_from=token, ...)
+```
+
+### 2. Store Token with Model Checkpoint
+
+Always save the MX8 token alongside model and optimizer state:
+
+```python
+torch.save({
+    "model": model.state_dict(),
+    "optimizer": optimizer.state_dict(),
+    "mx8_token": loader.checkpoint(),
+    "step": step,
+}, "checkpoint.pt")
+```
+
+### 3. Validate Token Before Training
+
+Check that the token is valid before starting long training runs:
+
+```python
+if resume_token:
+    try:
+        loader = mx8.load(dataset, resume_from=resume_token, ...)
+        print("Resume token valid")
+    except Exception as e:
+        print(f"Invalid resume token: {e}")
+        raise
+```
+
+### 4. Checkpoint Frequency
+
+Balance checkpoint overhead with recovery time:
+
+```python
+# Checkpoint every N steps
+if step % 1000 == 0:
+    token = loader.checkpoint()
+    save_checkpoint(...)
+
+# Or checkpoint every N minutes
+if time.time() - last_checkpoint_time > 600:  # 10 minutes
+    token = loader.checkpoint()
+    save_checkpoint(...)
+    last_checkpoint_time = time.time()
+```
+
+### 5. Distributed Sync
+
+In distributed training, ensure all ranks checkpoint at the same step:
+
+```python
+import torch.distributed as dist
+
+if step % 1000 == 0:
+    # Barrier ensures all ranks checkpoint together
+    dist.barrier()
+    token = loader.checkpoint()
+    
+    if rank == 0:
+        save_checkpoint({"mx8_token": token, "step": step})
+    
+    dist.barrier()
+```
+
+---
+
+## Troubleshooting
+
+### Token Validation Failed
+
+**Error**: `RuntimeError: checkpoint token validation failed: manifest_hash mismatch`
+
+**Cause**: Dataset changed between checkpoint and resume.
+
+**Solution**: Pin manifest hash at start of training:
+
+```python
+manifest_hash = mx8.resolve_manifest_hash(dataset)
+pinned = f"{dataset}@sha256:{manifest_hash}"
+# Use pinned for all epochs and resume
+```
+
+### Late Resume Token Rejected
+
+**Error**: `RuntimeError: resume_from is a startup input only`
+
+**Cause**: Trying to pass `resume_from` after loader has already issued leases.
+
+**Solution**: Pass `resume_from` when creating the loader, not after iteration starts.
+
+### Distributed Token Mismatch
+
+**Error**: `RuntimeError: conflicting resume tokens from different ranks`
+
+**Cause**: Ranks are passing different checkpoint tokens.
+
+**Solution**: Ensure all ranks load the same checkpoint:
+
+```python
+# Rank 0 saves checkpoint
+if rank == 0:
+    save_checkpoint({"mx8_token": token})
+
+# All ranks load same checkpoint
+dist.barrier()
+ckpt = load_checkpoint()  # All ranks read same file
+token = ckpt["mx8_token"]
+```

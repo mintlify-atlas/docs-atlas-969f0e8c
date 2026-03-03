@@ -1,0 +1,345 @@
+---
+title: Runtime Environment Variables
+description: Runtime and performance tuning parameters for MX8
+---
+
+## Overview
+
+Runtime variables control performance tuning, resource limits, and feature flags across the MX8 data pipeline. These are shared between agents, Python loaders, and runtime processes.
+
+## Memory and Resource Limits
+
+<ParamField path="MX8_MAX_INFLIGHT_BYTES" type="integer" default="134217728">
+  Total byte budget for in-flight data across the pipeline.
+  
+  Default: 128MB (`134217728` bytes)
+  
+  Higher values increase throughput but require more memory.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_MAX_PROCESS_RSS_BYTES" type="integer" default="unset">
+  Whole-process RSS (Resident Set Size) fail-fast cap.
+  
+  If set, the process will terminate when RSS exceeds this limit.
+  
+  **Production**: Set as an org-wide policy default, not per-job.
+  
+  Python loaders have derived defaults based on available memory.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_MAX_BATCH_BYTES" type="integer" default="unset">
+  Hard byte cap per batch.
+  
+  If set, batches will never exceed this size. Must be `<= MX8_MAX_INFLIGHT_BYTES`.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_TARGET_BATCH_BYTES" type="integer" default="unset">
+  Target byte size per batch.
+  
+  Batches aim for this size but may vary based on sample sizes. Must be `<= MX8_MAX_BATCH_BYTES` if both are set.
+  
+  **Stability**: `stable`
+</ParamField>
+
+## Pipeline Configuration
+
+<ParamField path="MX8_BATCH_SIZE_SAMPLES" type="integer" default="512">
+  Number of samples per batch.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_PREFETCH_BATCHES" type="integer" default="1">
+  Pipeline read-ahead depth (number of batches to prefetch).
+  
+  Higher values improve throughput at the cost of memory.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_MAX_QUEUE_BATCHES" type="integer" default="64">
+  Maximum batches in the delivered queue.
+  
+  Acts as backpressure when consumer is slower than the pipeline.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_PROGRESS_INTERVAL_MS" type="integer" default="500">
+  Progress reporting interval in milliseconds.
+  
+  Controls how often progress is reported to the coordinator.
+  
+  **Stability**: `stable`
+</ParamField>
+
+## Cloud Storage Tuning
+
+### S3
+
+<ParamField path="MX8_S3_ENDPOINT_URL" type="string" default="unset">
+  S3 endpoint URL override.
+  
+  Use for S3-compatible services like MinIO or LocalStack.
+  
+  Example: `http://localhost:9000`
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_S3_FORCE_PATH_STYLE" type="boolean" default="auto">
+  Force path-style S3 addressing.
+  
+  Auto-enabled when `MX8_S3_ENDPOINT_URL` is set.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_S3_LABEL_MODE" type="string" default="auto">
+  Label extraction mode for S3 datasets.
+  
+  Valid values: `auto`, `none`, `imagefolder`
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_S3_SCAN_SHUFFLE_SEED" type="integer" default="current unix time">
+  Shuffle seed for S3 object listing.
+  
+  Type: `u64`
+  
+  Defaults to current Unix timestamp for non-deterministic shuffling.
+  
+  **Stability**: `experimental`
+</ParamField>
+
+### Azure Blob Storage
+
+<ParamField path="MX8_AZURE_ENDPOINT_URL" type="string" default="unset">
+  Azure Blob Storage endpoint URL.
+  
+  Use for Azure or emulator endpoints (e.g., Azurite).
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_AZURE_ANONYMOUS" type="boolean" default="false">
+  Enable anonymous access to Azure Blob Storage.
+  
+  **Stability**: `stable`
+</ParamField>
+
+### Google Cloud Storage
+
+<ParamField path="MX8_GCS_ENDPOINT_URL" type="string" default="unset">
+  GCS endpoint URL override.
+  
+  Use for GCS emulator or custom endpoints.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_GCS_ANONYMOUS" type="boolean" default="false">
+  Enable anonymous access to GCS.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_GCS_SCAN_SHUFFLE_SEED" type="integer" default="current unix time">
+  Shuffle seed for GCS object listing.
+  
+  Type: `u64`
+  
+  Defaults to current Unix timestamp.
+  
+  **Stability**: `experimental`
+</ParamField>
+
+## Image Processing
+
+<ParamField path="MX8_DECODE_BACKEND" type="string" default="python">
+  Image decode backend selection.
+  
+  Valid values: `python`, `rust`
+  
+  **Stability**: `experimental`
+</ParamField>
+
+<ParamField path="MX8_RUST_JPEG_CODEC" type="string" default="zune">
+  Rust JPEG codec when `MX8_DECODE_BACKEND=rust`.
+  
+  Valid values: `zune`, `image`, `turbo`
+  
+  **Stability**: `experimental`
+</ParamField>
+
+<ParamField path="MX8_RUST_RESIZE_BACKEND" type="string" default="fast">
+  Rust image resize backend.
+  
+  Valid values: `fast`, `image`
+  
+  **Stability**: `experimental`
+</ParamField>
+
+<ParamField path="MX8_DECODE_THREADS" type="integer" default="host parallelism">
+  Number of threads for image decoding.
+  
+  Defaults to available parallelism on the host.
+  
+  **Stability**: `experimental`
+</ParamField>
+
+## Video Processing
+
+<ParamField path="MX8_VIDEO_DECODE_BACKEND" type="string" default="cli">
+  Video decode backend selection.
+  
+  Valid values: `cli`, `ffi`
+  
+  **Stability**: `experimental`
+</ParamField>
+
+<ParamField path="MX8_FFMPEG_BIN" type="string" default="ffmpeg">
+  Path to the `ffmpeg` binary for video decoding.
+  
+  **Stability**: `experimental`
+</ParamField>
+
+<ParamField path="MX8_VIDEO_STAGE1_INDEX" type="boolean" default="false">
+  Enable stage-1 video indexing.
+  
+  **Stability**: `experimental`
+</ParamField>
+
+<ParamField path="MX8_VIDEO_STAGE1_DISABLE_FFPROBE" type="boolean" default="false">
+  Disable `ffprobe` during stage-1 indexing.
+  
+  **Stability**: `experimental`
+</ParamField>
+
+<ParamField path="MX8_VIDEO_STAGE1_BYTES_PER_FRAME_ESTIMATE" type="integer" default="51200">
+  Estimated bytes per frame for video stage-1 indexing.
+  
+  **Stability**: `experimental`
+</ParamField>
+
+<ParamField path="MX8_VIDEO_STAGE2_MAX_CLIPS_IN_MEMORY" type="integer" default="2000000">
+  Maximum video clips kept in memory during stage-2 indexing.
+  
+  **Stability**: `experimental`
+</ParamField>
+
+<ParamField path="MX8_VIDEO_STAGE2_BYTES_PER_CLIP" type="integer" default="4096">
+  Estimated bytes per clip for memory accounting.
+  
+  **Stability**: `experimental`
+</ParamField>
+
+<ParamField path="MX8_VIDEO_STAGE2D_MAX_RANGES" type="integer" default="8">
+  Maximum number of byte ranges for stage-2D video planning.
+  
+  **Stability**: `experimental`
+</ParamField>
+
+<ParamField path="MX8_VIDEO_STAGE2D_MERGE_GAP_BYTES" type="integer" default="0">
+  Gap threshold (in bytes) for merging adjacent byte ranges.
+  
+  **Stability**: `experimental`
+</ParamField>
+
+<ParamField path="MX8_VIDEO_AUTOTUNE_PERIOD_BATCHES" type="integer" default="16">
+  Autotune period (in batches) for video runtime.
+  
+  **Stability**: `experimental`
+</ParamField>
+
+## Zero-Manifest Mode
+
+<ParamField path="MX8_ZERO_MANIFEST_ENABLED" type="boolean" default="true">
+  Enable zero-manifest mode for Python DataLoader.
+  
+  When enabled, the loader can operate without a precomputed manifest by sampling directly from storage.
+  
+  **Stability**: `experimental`
+</ParamField>
+
+<ParamField path="MX8_ZERO_MANIFEST_RESERVOIR" type="integer" default="100000">
+  Reservoir size for zero-manifest sampling.
+  
+  **Stability**: `experimental`
+</ParamField>
+
+## Mix and Autotune
+
+<ParamField path="MX8_MIX_AUTOTUNE_PERIOD_TICKS" type="integer" default="32">
+  Autotune period (in ticks) for mix runtime.
+  
+  **Stability**: `experimental`
+</ParamField>
+
+<ParamField path="MX8_MIX_SNAPSHOT" type="boolean" default="false">
+  Enable mix diagnostics snapshots.
+  
+  **Stability**: `experimental`
+</ParamField>
+
+<ParamField path="MX8_MIX_SNAPSHOT_PERIOD_TICKS" type="integer" default="64">
+  Snapshot period (in ticks) for mix diagnostics.
+  
+  **Stability**: `experimental`
+</ParamField>
+
+## Logging
+
+<ParamField path="MX8_LOG" type="string" default="info">
+  Rust tracing filter string.
+  
+  Falls back to `RUST_LOG`, then defaults to `info`.
+  
+  Examples:
+  - `info` (default)
+  - `mx8=debug,info` (debug MX8 crates only)
+  - `mx8_coordinator=trace` (trace coordinator only)
+  
+  **Stability**: `stable`
+</ParamField>
+
+## Example Configurations
+
+<CodeGroup>
+```bash High Throughput
+MX8_BATCH_SIZE_SAMPLES=1024
+MX8_PREFETCH_BATCHES=4
+MX8_MAX_INFLIGHT_BYTES=268435456  # 256MB
+MX8_MAX_QUEUE_BATCHES=128
+```
+
+```bash Memory Constrained
+MX8_BATCH_SIZE_SAMPLES=256
+MX8_PREFETCH_BATCHES=1
+MX8_MAX_INFLIGHT_BYTES=67108864  # 64MB
+MX8_MAX_PROCESS_RSS_BYTES=8589934592  # 8GB
+```
+
+```bash S3-Compatible (MinIO)
+MX8_S3_ENDPOINT_URL='http://localhost:9000'
+MX8_S3_FORCE_PATH_STYLE=true
+```
+
+```bash Debug Logging
+MX8_LOG='mx8=trace'
+MX8_METRICS_SNAPSHOT_INTERVAL_MS=5000
+```
+</CodeGroup>
+
+## Related Resources
+
+- [Coordinator Variables](/api/env/coordinator) - Coordinator configuration
+- [Agent Variables](/api/env/agent) - Agent-specific settings
+- [Monitoring Guide](/guides/monitoring) - Performance monitoring and optimization

@@ -1,0 +1,373 @@
+---
+title: "Text Loader (mx8.text)"
+description: "Tokenization pipeline with fixed-shape token batches for language model training"
+---
+
+## Overview
+
+`mx8.text()` tokenizes text samples inside Rust and emits fixed-shape token batches ready for direct model input.
+
+## Basic Usage
+
+```python
+import mx8
+
+loader = mx8.text(
+    "s3://bucket/corpus@refresh",
+    tokenizer="gpt2",
+    sequence_length=2048,
+    stride=2048,
+    add_bos=False,
+    add_eos=True,
+    batch_size_samples=32,
+    max_ram_gb=12,
+    profile="balanced",
+)
+
+for batch in loader:
+    token_ids = batch.token_ids        # [B, sequence_length] int64
+    attention = batch.attention_mask   # [B, sequence_length] bool (or None)
+    sample_ids = batch.sample_ids      # [B] int64
+```
+
+## Parameters
+
+### Tokenization
+
+<ParamField path="tokenizer" type="str" required>
+  Tokenizer reference. Supports:
+  - `"gpt2"` for built-in GPT-2 tokenizer
+  - Path to local `tokenizer.json` file
+</ParamField>
+
+<ParamField path="sequence_length" type="int" required>
+  Fixed output token length for each emitted row
+</ParamField>
+
+<ParamField path="stride" type="int" required>
+  Step size for chunking long tokenized sequences. Use `stride < sequence_length` for overlap.
+</ParamField>
+
+<ParamField path="add_bos" type="bool" default={false}>
+  Prepend BOS token when available in tokenizer config
+</ParamField>
+
+<ParamField path="add_eos" type="bool" default={false}>
+  Append EOS token when available in tokenizer config
+</ParamField>
+
+<ParamField path="truncate" type="str" default="right">
+  Long-sequence handling:
+  - `"right"`: truncate from the right
+  - `"error"`: fail on sequences exceeding `sequence_length`
+</ParamField>
+
+<ParamField path="return_attention_mask" type="bool" default={false}>
+  Emit `batch.attention_mask` when `True`
+</ParamField>
+
+<ParamField path="decode_error_policy" type="str" default="error">
+  UTF-8 decode handling:
+  - `"error"`: fail on decode errors
+  - `"skip"`: skip samples that fail to decode
+</ParamField>
+
+### Dataset & Memory
+
+<ParamField path="dataset_link" type="str" required>
+  Path or S3 prefix to text corpus
+</ParamField>
+
+<ParamField path="batch_size_samples" type="int" required>
+  Number of sequences per batch
+</ParamField>
+
+<ParamField path="max_ram_gb" type="int | float" required>
+  Memory budget
+</ParamField>
+
+<ParamField path="profile" type="str" default="balanced">
+  Safety/throughput preset: `"safe"`, `"balanced"`, or `"throughput"`
+</ParamField>
+
+<ParamField path="manifest_store" type="str" default="~/.mx8/manifests">
+  Manifest store root
+</ParamField>
+
+<ParamField path="manifest_path" type="str">
+  Override with local manifest TSV
+</ParamField>
+
+<ParamField path="recursive" type="bool" default={true}>
+  Index subdirectories recursively
+</ParamField>
+
+<ParamField path="start_id" type="int">
+  Starting sample ID (must be set with `end_id`)
+</ParamField>
+
+<ParamField path="end_id" type="int">
+  Ending sample ID (exclusive)
+</ParamField>
+
+<ParamField path="autopack" type="bool" default={false}>
+  Auto-pack dataset if no manifest exists
+</ParamField>
+
+<ParamField path="autopack_shard_mb" type="int" default={512}>
+  Shard size for auto-packing
+</ParamField>
+
+### Distributed Execution
+
+<ParamField path="job_id" type="str">
+  Job identifier for distributed mode
+</ParamField>
+
+<ParamField path="cluster_url" type="str">
+  Coordinator URL (falls back to `MX8_CLUSTER_URL`)
+</ParamField>
+
+<ParamField path="resume_from" type="str">
+  Checkpoint token from `loader.checkpoint()`
+</ParamField>
+
+## Usage Patterns
+
+<Tabs>
+  <Tab title="Basic Training">
+    ```python
+    import mx8
+
+    loader = mx8.text(
+        "s3://bucket/corpus@refresh",
+        tokenizer="gpt2",
+        sequence_length=2048,
+        stride=2048,
+        add_eos=True,
+        batch_size_samples=32,
+        max_ram_gb=12,
+    )
+
+    for batch in loader:
+        token_ids = batch.token_ids  # [32, 2048]
+        loss = model(token_ids)
+        loss.backward()
+        optimizer.step()
+    ```
+  </Tab>
+
+  <Tab title="With Attention Mask">
+    ```python
+    import mx8
+
+    loader = mx8.text(
+        "s3://bucket/corpus/",
+        tokenizer="gpt2",
+        sequence_length=2048,
+        stride=2048,
+        return_attention_mask=True,
+        batch_size_samples=32,
+        max_ram_gb=12,
+    )
+
+    for batch in loader:
+        token_ids = batch.token_ids          # [B, 2048]
+        attention_mask = batch.attention_mask  # [B, 2048]
+        
+        outputs = model(
+            input_ids=token_ids,
+            attention_mask=attention_mask,
+        )
+    ```
+  </Tab>
+
+  <Tab title="Overlapping Windows">
+    ```python
+    import mx8
+
+    # 50% overlap for context continuity
+    loader = mx8.text(
+        "s3://bucket/corpus/",
+        tokenizer="gpt2",
+        sequence_length=2048,
+        stride=1024,  # 50% overlap
+        batch_size_samples=32,
+        max_ram_gb=12,
+    )
+
+    for batch in loader:
+        token_ids = batch.token_ids
+        train_step(token_ids)
+    ```
+  </Tab>
+
+  <Tab title="Custom Tokenizer">
+    ```python
+    import mx8
+
+    # Use custom tokenizer.json
+    loader = mx8.text(
+        "s3://bucket/corpus/",
+        tokenizer="/path/to/tokenizer.json",
+        sequence_length=2048,
+        stride=2048,
+        batch_size_samples=32,
+        max_ram_gb=12,
+    )
+
+    for batch in loader:
+        token_ids = batch.token_ids
+        train_step(token_ids)
+    ```
+  </Tab>
+
+  <Tab title="Distributed">
+    ```python
+    import mx8
+
+    loader = mx8.text(
+        "s3://bucket/corpus/",
+        tokenizer="gpt2",
+        sequence_length=2048,
+        stride=2048,
+        batch_size_samples=128,
+        max_ram_gb=24,
+        job_id="train-llm",
+        cluster_url="http://coordinator:50051",
+    )
+
+    for batch in loader:
+        token_ids = batch.token_ids
+        train_step(token_ids)
+    ```
+  </Tab>
+</Tabs>
+
+## Batch Format
+
+Each batch contains:
+
+- **`token_ids`**: `[B, sequence_length]` int64 tensor of token IDs
+- **`attention_mask`**: `[B, sequence_length]` bool tensor (only if `return_attention_mask=True`)
+- **`sample_ids`**: `[B]` int64 array of source sample identifiers
+
+```python
+for batch in loader:
+    print(batch.token_ids.shape)        # (32, 2048)
+    print(batch.sample_ids.shape)       # (32,)
+    if batch.attention_mask is not None:
+        print(batch.attention_mask.shape)  # (32, 2048)
+```
+
+## Chunking & Stride
+
+Long documents are chunked into multiple sequences:
+
+```python
+# Document with 5000 tokens, sequence_length=2048, stride=2048
+# → Produces 3 sequences:
+#   [0:2048], [2048:4096], [4096:5000 padded to 2048]
+
+loader = mx8.text(
+    "s3://bucket/corpus/",
+    tokenizer="gpt2",
+    sequence_length=2048,
+    stride=2048,
+    batch_size_samples=32,
+    max_ram_gb=12,
+)
+```
+
+For overlapping windows:
+
+```python
+# Document with 5000 tokens, sequence_length=2048, stride=1024
+# → Produces 5 sequences with 1024-token overlap:
+#   [0:2048], [1024:3072], [2048:4096], [3072:5120], ...
+
+loader = mx8.text(
+    "s3://bucket/corpus/",
+    tokenizer="gpt2",
+    sequence_length=2048,
+    stride=1024,  # 50% overlap
+    batch_size_samples=32,
+    max_ram_gb=12,
+)
+```
+
+## Stats & Monitoring
+
+```python
+stats = loader.stats()
+
+# Text-specific fields
+print(stats["text_sequence_length"])         # 2048
+print(stats["text_stride"])                  # 2048
+print(stats["text_return_attention_mask"])   # True/False
+
+# Standard pipeline metrics
+print(stats["delivered_samples_total"])
+print(stats["ram_high_water_bytes"])
+```
+
+## Checkpoint & Resume
+
+```python
+import mx8
+
+loader = mx8.text(
+    "s3://bucket/corpus/",
+    tokenizer="gpt2",
+    sequence_length=2048,
+    stride=2048,
+    batch_size_samples=32,
+    max_ram_gb=12,
+)
+
+for step, batch in enumerate(loader):
+    train_step(batch.token_ids)
+    
+    if step % 1000 == 0:
+        token = loader.checkpoint()
+        save_checkpoint(model, token)
+
+# Resume from checkpoint
+loader = mx8.text(
+    "s3://bucket/corpus/",
+    tokenizer="gpt2",
+    sequence_length=2048,
+    stride=2048,
+    batch_size_samples=32,
+    max_ram_gb=12,
+    resume_from=token,
+)
+```
+
+## Best Practices
+
+<Check>
+**Match `stride` to `sequence_length` for non-overlapping chunks** — prevents duplicate training on the same tokens
+</Check>
+
+<Check>
+**Use `add_eos=True` for causal language modeling** — helps model learn sequence boundaries
+</Check>
+
+<Check>
+**Enable `return_attention_mask` for variable-length sequences** — required for proper padding handling
+</Check>
+
+<Check>
+**Set `decode_error_policy="skip"` for noisy web corpora** — prevents training interruption from encoding issues
+</Check>
+
+<Warning>
+**Tokenization happens in Rust** — no Python overhead, but custom preprocessing must happen before packing
+</Warning>
+
+## See Also
+
+- [Byte Loader](/loaders/bytes) - Raw byte streaming
+- [Mix API](/loaders/mix) - Blend multiple text corpora
+- Gate tests: `./scripts/text_gate.sh`

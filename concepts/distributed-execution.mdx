@@ -1,0 +1,439 @@
+---
+title: Distributed Execution
+description: Coordinator/agent model, leases, and failure recovery
+---
+
+MX8's distributed execution model separates cluster-level decisions (coordinator) from local execution (agent) to ensure stable throughput, bounded memory, and graceful recovery from node failures.
+
+## Coordinator/Agent Model
+
+The MX8 distributed system has three layers:
+
+1. **Coordinator** (one per job): cluster authority for leases and ownership
+2. **Agent** (one per node): local authority for budgets and runtime feeding
+3. **Runtime** (in-process): bounded pipeline executing work ranges
+
+<Info>
+The coordinator and agents communicate via gRPC. The runtime is embedded in your Python process and communicates with the local agent via localhost/unix socket.
+</Info>
+
+## Lease Lifecycle
+
+A **lease** is temporary ownership of a contiguous range of sample IDs.
+
+```rust
+Lease {
+    lease_id: String,
+    node_id: String,
+    range: WorkRange {
+        start_id: u64,
+        end_id: u64,    // half-open
+        epoch: u32,
+        seed: u64,
+    },
+    expires_at: Timestamp,
+    cursor: u64,        // Progress within range
+}
+```
+
+### Happy Path
+
+```
+Runtime (mx8)            Node Agent (mx8d)                              Coordinator
+    |                          |                                            |
+    |  GetNextRange()          |                                            |
+    |------------------------->|                                            |
+    |                          |  RequestLease(want=N)                      |
+    |                          |------------------------------------------->|
+    |                          |  LeaseGranted(WorkRange, lease_id, ttl)    |
+    |                          |<-------------------------------------------|
+    |  WorkRange(...)          |                                            |
+    |<-------------------------|                                            |
+    |  fetch/decode/pack/deliver (bounded queues + backpressure)            |
+    |  cursor advances after DELIVER                                        |
+    |                          |  ReportProgress(lease_id, cursor)          |
+    |------------------------->|------------------------------------------->|
+    |                          |  Heartbeat(stats) every ~1s                |
+    |                          |------------------------------------------->|
+```
+
+### Failure and Recovery
+
+```
+Runtime (mx8)            Node Agent (mx8d)                              Coordinator
+    |                          |                                            |
+    |                (if node dies / heartbeats stop)                       |
+    |                          |                                            |
+    |                          |                    expire lease after TTL  |
+    |                          |                    requeue [cursor,end)   |
+    |                          |                    reassign remainder      |
+    |                          |<-------------------------------------------|
+    |  WorkRange(remainder)    |                                            |
+    |<-------------------------|                                            |
+```
+
+<Warning>
+**Cursor semantics:** Cursor advances only after **DELIVER** (batch handed to Python/consumer), not after fetch or decode. This ensures at-least-once delivery at boundaries.
+</Warning>
+
+## Membership and World Size
+
+### Initial Barrier
+
+The coordinator waits for `world_size` nodes to register before issuing any leases.
+
+```bash
+# Coordinator
+export MX8_WORLD_SIZE=8
+target/release/mx8-coordinator
+
+# Agents (start 8)
+export MX8_NODE_ID=node-0
+target/release/mx8d-agent
+```
+
+Once 8 nodes register, membership is **frozen** and leases are issued.
+
+### Min World Size
+
+You can start the job under a partial cluster:
+
+```bash
+export MX8_WORLD_SIZE=8
+export MX8_MIN_WORLD_SIZE=4  # Start when 4 nodes register
+```
+
+Membership freezes when 4 nodes register, even if only 4 of 8 slots are filled.
+
+### Dynamic Membership (v1.8.2+)
+
+After the initial barrier, MX8 supports elastic membership changes:
+
+<Accordion title="Departed Nodes">
+When a node's heartbeat expires, the coordinator:
+
+1. Adds it to `departed_nodes`
+2. Releases its unissued rank-ranges back to the global pool
+3. Expires active leases and requeues `[cursor, end)`
+
+Dead nodes are tracked exactly once (no double-release).
+</Accordion>
+
+<Accordion title="Replacement Nodes">
+A new node ID may register after freeze if at least one slot is vacant (in `departed_nodes`):
+
+1. New node inherits the departed rank slot
+2. Can immediately request leases for requeued work
+</Accordion>
+
+<Accordion title="Scale-Out Nodes">
+If no slot is vacant and current frozen membership is below configured `world_size`:
+
+1. New node is admitted into a new rank slot
+2. Unissued ranges are repartitioned across expanded membership
+3. New node immediately receives work
+</Accordion>
+
+<Accordion title="Same-Identity Recovery">
+A node that briefly loses connectivity and re-registers with the same ID:
+
+1. Is un-departed
+2. Resumes its original rank
+3. Continues work from last cursor
+</Accordion>
+
+<Note>
+**Determinism:** Fixed-membership runs are deterministic. Any post-freeze membership change (replacement or scale-out) may reorder unissued work at the boundary.
+</Note>
+
+## Durable Lease Log (v1.8.3+)
+
+The coordinator writes an **append-only write-ahead log** to disk for both lease completion and accepted cursor progress.
+
+### Format
+
+```
+H v1 sha256:a3f2b8c9d1e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0
+C 0 65536
+C 65536 131072
+P 131072 196608 145000
+C 196608 262144
+```
+
+- `H v1 <manifest_hash>`: header (manifest hash validation)
+- `C <start_id> <end_id>`: completed range
+- `P <start_id> <end_id> <cursor>`: durable progress
+
+### Replay Behavior
+
+On restart, the log is replayed:
+
+1. Completed ranges are skipped
+2. Partially progressed ranges resume from last durable cursor
+3. Header manifest hash is validated against requested run hash (mismatch = startup error)
+
+### Configuration
+
+```bash
+# Default path
+export MX8_LEASE_LOG_PATH="~/.mx8/lease_logs/<manifest_hash>.log"
+
+# Disable durable log
+export MX8_LEASE_LOG_PATH=none
+```
+
+<Warning>
+**Fail-closed startup:** If the log cannot be opened/replayed while enabled, coordinator startup fails. Explicitly set `--lease-log-path=none` to opt out.
+</Warning>
+
+### Durability Guarantees
+
+- Each append calls `sync_data()` before returning
+- **Crash window:** if a crash happens after an accepted progress update but before the durable `P` write, replay resumes from the last durable cursor (not beyond)
+- Bounded replay is at most the unflushed progress interval for affected ranges
+- **Invariant:** completed ranges are never re-issued after coordinator restart
+
+## High Availability (Default in v1.8.7)
+
+Default mode: **leader-fenced coordinator** with durable shared state replay enabled.
+
+### Leader Election
+
+Multiple coordinator candidates compete for a shared lease file:
+
+1. Candidate acquires lease by writing `{leader_id, expires_at}`
+2. Leader renews lease every `ha_renew_interval_ms` (default 1s)
+3. If leader fails to renew, lease expires after `ha_lease_ttl_ms` (default 5s)
+4. New leader acquires lease and replays shared state
+
+### Configuration
+
+```bash
+# Enable HA (default: true)
+export MX8_COORD_HA_ENABLE=true
+
+# Shared lease file (all candidates must access this path)
+export MX8_COORD_HA_LEASE_PATH="s3://bucket/manifests/ha/<manifest_hash>.leader_lease"
+
+# Shared state snapshot (all candidates must access this path)
+export MX8_COORD_STATE_STORE_PATH="s3://bucket/manifests/state/<manifest_hash>.json"
+
+# Leader identity
+export MX8_COORD_HA_LEADER_ID="coordinator-0"
+
+# Timing
+export MX8_COORD_HA_LEASE_TTL_MS=5000      # 5s
+export MX8_COORD_HA_RENEW_INTERVAL_MS=1000 # 1s
+```
+
+<Info>
+**Operator requirement:** Shared durable lease/state paths must be accessible across all coordinator candidates. Use S3 or shared filesystem.
+</Info>
+
+### Disabling HA
+
+For single-coordinator deployments:
+
+```bash
+export MX8_COORD_HA_ENABLE=false
+```
+
+## Default Policies
+
+### Heartbeat and Lease Timings
+
+- **Heartbeat interval**: 1s (agent → coordinator)
+- **Coordinator tick**: 1s (expire leases, grant new leases)
+- **Lease TTL**: ~10s (how long before silent lease is expired)
+
+### Range Sizing
+
+- **Target**: ~5 seconds of work per range (adaptive based on observed throughput)
+- **Lease unit**: 1 lease = 1 shuffle block
+- **Nodes may hold**: multiple concurrent leases (controlled by `want`)
+
+### No Mid-Flight Splitting
+
+v1.8 does not split leases mid-flight. If a range is too large, wait for it to complete or fail.
+
+## Example: Starting a Distributed Job
+
+### 1. Start Coordinator
+
+```bash
+MX8_COORD_BIND_ADDR=0.0.0.0:50051 \
+MX8_WORLD_SIZE=8 \
+MX8_DATASET_LINK='s3://bucket/imagenet/@sha256:a3f2b8c9' \
+MX8_MANIFEST_STORE_ROOT='s3://bucket/manifests/' \
+target/release/mx8-coordinator
+```
+
+### 2. Start Agents (one per node)
+
+```bash
+# Node 0
+MX8_COORD_URL='http://coordinator:50051' \
+MX8_JOB_ID='prod-job-001' \
+MX8_NODE_ID='node-0' \
+MX8_BATCH_SIZE_SAMPLES=512 \
+MX8_MAX_INFLIGHT_BYTES=134217728 \
+MX8_MAX_PROCESS_RSS_BYTES=68719476736 \
+target/release/mx8d-agent
+
+# Node 1
+MX8_NODE_ID='node-1' target/release/mx8d-agent
+# ... (repeat for 8 nodes)
+```
+
+### 3. Python Training Code
+
+```python
+import mx8
+import torch
+import torch.distributed as dist
+
+dist.init_process_group(backend="nccl")
+rank = dist.get_rank()
+
+loader = mx8.DistributedDataLoader(
+    coordinator_url="http://coordinator:50051",
+    job_id="prod-job-001",
+    node_id=f"node-{rank}",
+    batch_size_samples=256,
+    want=1,  # Single lease per node
+    max_inflight_bytes=256 * 1024 * 1024,
+    max_ram_gb=60,
+)
+
+model = YourModel().cuda()
+model = torch.nn.parallel.DistributedDataParallel(model)
+
+for epoch in range(num_epochs):
+    for batch in loader:
+        outputs = model(batch.payload)
+        loss = criterion(outputs, batch.label_ids)
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+```
+
+### 4. Monitor with TUI
+
+```bash
+cargo run -p mx8-tui -- \
+    --coord-url http://coordinator:50051 \
+    --job-id prod-job-001
+```
+
+## Recovery Scenarios
+
+### Agent Failure
+
+**Symptom:** Agent stops heartbeating
+
+**MX8 behavior:**
+1. Coordinator waits for lease TTL (10s)
+2. Expires active leases
+3. Requeues unfinished ranges `[cursor, end)`
+4. Other agents pick up requeued work
+
+**Operator action:**
+```bash
+# Bring failed agent back up with same node_id
+MX8_NODE_ID='node-3' target/release/mx8d-agent
+```
+
+### Coordinator Failure (HA Enabled)
+
+**Symptom:** Coordinator crashes or stops renewing lease
+
+**MX8 behavior:**
+1. Leader lease expires after 5s
+2. New candidate acquires lease
+3. Replays shared state from `MX8_COORD_STATE_STORE_PATH`
+4. Replays lease log from `MX8_LEASE_LOG_PATH`
+5. Agents reconnect and resume
+
+**Operator action:**
+```bash
+# Verify shared paths are accessible
+ls -lh s3://bucket/manifests/ha/<manifest_hash>.leader_lease
+ls -lh s3://bucket/manifests/state/<manifest_hash>.json
+
+# Start new coordinator candidate
+target/release/mx8-coordinator
+```
+
+### Network Partition
+
+**Symptom:** Agent loses connectivity to coordinator
+
+**MX8 behavior:**
+1. Agent stops heartbeating
+2. Coordinator expires leases and requeues work
+3. If agent reconnects with same `node_id`, it resumes original rank
+
+**Operator action:**
+No action needed if connectivity restored within lease TTL.
+
+## Observability
+
+### Heartbeat Stats
+
+Node stats include:
+- `inflight_bytes`: current pipeline usage
+- `ram_high_water_bytes`: peak RSS observed
+- Queue depths for each stage
+- Autotune/jitter summaries (when available)
+
+### Metrics
+
+```python
+for batch in loader:
+    stats = loader.stats()
+    print(f"Samples/sec: {stats['samples_per_sec']:.1f}")
+    print(f"Bytes/sec: {stats['bytes_per_sec'] / 1e6:.1f}MB/s")
+    print(f"Inflight: {stats['inflight_bytes'] / 1e6:.1f}MB")
+    print(f"Stage p95: fetch={stats['fetch_p95_ms']:.1f}ms")
+```
+
+### Proof Logs
+
+Enable structured events:
+
+```bash
+export MX8_LOG=mx8_proof=info
+```
+
+Events emitted:
+- `lease_granted`: when coordinator issues a lease
+- `lease_completed`: when agent finishes a lease
+- `lease_expired`: when coordinator expires a lease
+- `membership_frozen`: when world size barrier is met
+- `node_departed`: when heartbeat expires
+- `node_replaced`: when new node takes departed slot
+
+## Core Invariants
+
+<Warning>
+MX8 enforces these invariants at all times:
+</Warning>
+
+1. **No overlap**: a sample ID belongs to at most one *live* lease at a time
+2. **Bounded memory**: every pipeline stage has hard caps; backpressure prevents runaway prefetch
+3. **Deterministic (failure-free)**: for a pinned snapshot and frozen membership, sharding/assignment is deterministic
+4. **Recovery**: if a node dies, unfinished portion of its lease can be reassigned (inference/ETL)
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Memory Contract" icon="memory" href="/concepts/memory-contract">
+    Learn about memory guarantees
+  </Card>
+  <Card title="Deployment Guide" icon="rocket" href="/guides/deployment">
+    Deploy your first distributed job
+  </Card>
+  <Card title="Troubleshooting" icon="wrench" href="/operations/troubleshooting">
+    Debug common issues
+  </Card>
+</CardGroup>

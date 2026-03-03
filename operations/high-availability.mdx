@@ -1,0 +1,158 @@
+---
+title: High Availability
+description: HA setup and failover for MX8 coordinator
+---
+
+MX8 v1.8.7+ includes coordinator high availability (HA) enabled by default. This page defines what coordinator HA means, what it covers, and how to configure it.
+
+## Status
+
+**Enabled by default in v1.8.7**
+
+Can be disabled with `MX8_COORD_HA_ENABLE=0`.
+
+## Current Behavior
+
+Default mode uses HA coordinator leadership with shared lease/state paths across coordinator candidates. If the active leader dies, a follower can promote and continue with replayed state.
+
+### Shipped Foundations
+
+| Version | Feature |
+|---------|----------|
+| v1.8.3 | Coordinator restart recovery replays durable completion and durable cursor progress from the lease log |
+| v1.8.4 | Lease-file leader election + term fencing fences mutating RPCs on stale coordinators |
+| v1.8.5 | Durable coordinator state snapshots (`MX8_COORD_STATE_STORE_ENABLE=1`, auto-enabled with HA) persist membership, lease index, progress cursors, completed ranges, and counters; new leaders replay this state before accepting mutating work |
+| v1.8.6 | Deterministic kill-leader failover gates (`./scripts/ha_failover_gate.sh`) validate follower promotion continuity, no-overlap for newly issued leases after promotion, and duplicate progress replay acceptance across failover |
+| v1.8.7 | HA default posture is the standard deployment mode. Single-coordinator behavior is now opt-out via `MX8_COORD_HA_ENABLE=0` |
+
+For incident procedures, see the [Production Runbook](/operations/production-runbook).
+
+## Guarantees in Default HA Mode
+
+HA covers per-job coordinator availability for inference, ETL, and preprocessing jobs.
+
+<Warning>
+HA does not cover training elasticity. Training remains non-elastic in v1.8.x.
+</Warning>
+
+### Leader Election
+
+- Exactly one coordinator leader may mutate lease state at any time
+- Stale leaders are fenced and cannot write after losing leadership
+
+### State Durability
+
+The following survive leader failure and are recoverable by the promoted leader from shared durable state:
+- Lease grants
+- Expiry
+- Range requeue
+- Membership
+- Progress cursors
+
+### Failover Continuity
+
+- Followers can promote to leader without manual state repair
+- Agents reconnect and continue requesting leases and reporting progress
+- The no-overlap invariant is preserved across leader transitions
+- Progress report handling remains monotonic so duplicate replays across failover do not corrupt cursor state
+
+### Performance SLO
+
+Current failover SLO target: **control-plane recovery within 15 seconds at p95** under normal cluster conditions.
+
+## Configuration
+
+### Design Boundary
+
+Current HA implementation uses shared durable files for:
+- Leader lease: `MX8_COORD_HA_LEASE_PATH`
+- Coordinator state: `MX8_COORD_STATE_STORE_PATH`
+
+Plus coordinator-side fencing and replay logic.
+
+<Warning>
+If shared HA paths are misconfigured or not truly shared, stale-writer fencing still works but continuity across leader switch is not guaranteed.
+</Warning>
+
+Future storage/election backends may be added, but this contract is defined by invariants and gates, not by a specific backend.
+
+### Environment Variables
+
+```bash
+# Enable or disable HA (enabled by default)
+MX8_COORD_HA_ENABLE=1
+
+# Leader lease file path (must be shared across all coordinator candidates)
+MX8_COORD_HA_LEASE_PATH=/shared/path/to/lease.lock
+
+# Coordinator state store path (must be shared across all coordinator candidates)
+MX8_COORD_STATE_STORE_PATH=/shared/path/to/state/
+```
+
+## Failure Behavior
+
+### Active Leader Crashes
+
+When the active leader crashes or is killed:
+1. A follower can promote
+2. Replay shared state
+3. Continue serving mutating RPCs
+
+### Stale Leader Receives Traffic
+
+When a stale leader keeps receiving traffic after leadership loss:
+- Mutating RPCs are rejected with `FAILED_PRECONDITION`
+- Error message: `not leader for mutating operation`
+
+### Shared HA Paths Unavailable
+
+When shared HA paths are unavailable, the control plane must fail safe:
+- No split-brain writes
+- No un-fenced mutating progress
+
+## Acceptance Gates
+
+To keep HA as default production posture, all of the following gates must pass repeatedly:
+
+1. **Leader kill during active job**
+   - Kill the active leader during a multi-node run with active leases
+   - Verify failover completes within target and job drains correctly
+
+2. **No-overlap invariant**
+   - Assert no-overlap across the full leader transition
+
+3. **Stale leader fencing**
+   - Verify the demoted stale leader fails mutating operations after leadership loss
+
+4. **Duplicate replay handling**
+   - Replay duplicate progress/report requests across failover boundary
+   - Verify monotonic cursors and consistent completion
+
+5. **Leader churn soak**
+   - Run repeated leader churn over soak duration
+   - Verify no invariant violations accumulate
+
+### Running the HA Failover Gate
+
+```bash
+./scripts/ha_failover_gate.sh
+```
+
+This gate validates:
+- Follower promotion continuity
+- No-overlap for newly issued leases after promotion
+- Duplicate progress replay acceptance across failover
+
+## Training Elasticity Note
+
+<Warning>
+Training remains non-elastic in v1.8.x and this HA contract does not change that.
+</Warning>
+
+DDP rank/node loss tolerance requires a separate training-elasticity contract. See the [Production Runbook](/operations/production-runbook) for training v1 boundary model procedures.
+
+## Related Resources
+
+- [Production Runbook](/operations/production-runbook) - Coordinator failure procedures
+- [Troubleshooting](/operations/troubleshooting) - Common issues and solutions
+- [Security](/operations/security) - Security model and best practices

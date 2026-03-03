@@ -1,0 +1,249 @@
+---
+title: Troubleshooting
+description: Common issues and solutions for MX8
+---
+
+This page covers common errors and how to fix them. For production incidents and rollback procedures, see the [Production Runbook](/operations/production-runbook).
+
+## Build and Runtime Errors
+
+<AccordionGroup>
+  <Accordion title="reqwest rlib error during build or run">
+    You may see this error during `cargo run` or `./scripts/smoke.sh`:
+
+    ```
+    error: crate reqwest required to be available in rlib format, but was not found in this form
+    ```
+
+    This is an incremental build artifact issue, not a code problem. Fix it by cleaning the reqwest crate and rerunning:
+
+    ```bash
+    cargo clean -p reqwest
+    ```
+
+    Then rerun your original command.
+  </Accordion>
+
+  <Accordion title="rg: command not found in demo scripts">
+    Some scripts use `rg` (ripgrep) for log scanning. Install it with:
+
+    ```bash
+    brew install ripgrep  # macOS
+    ```
+
+    Then rerun the script.
+  </Accordion>
+
+  <Accordion title="permission denied or command not found with environment variables">
+    The most common cause is splitting a command with inline env vars across multiple lines incorrectly. The env vars must be on the same line as the command or exported beforehand.
+
+    **Correct:**
+    ```bash
+    MX8_BENCH_WANTS=1,4 WORLD_SIZE=16 ./scripts/demo2_minio_scale.sh
+    ```
+
+    **Incorrect** (splits the command):
+    ```bash
+    MX8_BENCH_WANTS=1,4 WORLD_SIZE=16 ./
+    scripts/demo2_minio_scale.sh
+    ```
+  </Accordion>
+
+  <Accordion title="Docker or MinIO startup failure">
+    If you see `Cannot connect to the Docker daemon`, Docker is not running.
+
+    Start Docker Desktop or the Docker daemon, then rerun the MinIO gate or script.
+  </Accordion>
+</AccordionGroup>
+
+## CI/CD Issues
+
+<AccordionGroup>
+  <Accordion title="GitHub Actions aarch64 wheel build fails with Docker exit code 1">
+    If the `wheels` workflow fails on `build (ubuntu-latest, aarch64)` with:
+
+    ```text
+    💥 maturin failed
+    Error: The process '/usr/bin/docker' failed with exit code 1
+    ```
+
+    Check for these known signatures in the job logs:
+    - `ring` / `aws-lc-sys` assembler failures like `ARM assembler must define __ARM_ARCH`
+    - `openssl-sys` failure like `fatal error: openssl/opensslv.h: No such file or directory`
+
+    This incident happened on March 2, 2026 and had two separate causes:
+    1. `manylinux2014-cross:aarch64` used an old cross compiler path that broke ARM assembly for `ring`/`aws-lc-sys`
+    2. Transitive `native-tls` pulled in `openssl-sys`, which requires target OpenSSL headers unavailable in the cross build path
+
+    ### Fix Checklist
+
+    1. In `.github/workflows/wheels.yml`, set `aarch64` wheels to `manylinux: "2_28"` (not `auto`/`2014`)
+    2. Keep Linux TLS deps on rustls-only paths:
+       - `google-cloud-storage = { default-features = false, features = ["auth", "rustls-tls"] }`
+       - patch `hf-hub` to avoid `native-tls` and use rustls-backed `reqwest`/`ureq`
+    3. Confirm OpenSSL is gone from the dependency graph:
+       ```bash
+       cargo tree --target all -i openssl-sys
+       cargo tree --target all -i native-tls
+       ```
+       Both commands should report no matching package.
+    4. Re-run the `wheels` workflow (`workflow_dispatch`) and verify:
+       - `build (ubuntu-latest, aarch64)` is `success`
+       - `build (ubuntu-latest, x86_64)` remains `success`
+  </Accordion>
+</AccordionGroup>
+
+## TLS and Certificate Issues
+
+<AccordionGroup>
+  <Accordion title="TrustStore native roots panic during MinIO smoke">
+    You may see a panic from `aws-smithy-http-client` in local debug builds:
+
+    ```
+    TrustStore configured to enable native roots but no valid root certificates parsed!
+    ```
+
+    This is an environment-specific TLS issue in debug builds, not a correctness problem with MX8.
+
+    Rerun with debug assertions disabled:
+    ```bash
+    CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false MX8_SMOKE_MINIO_S3_PREFIX_SNAPSHOT=1 ./scripts/smoke.sh
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Package Installation
+
+<AccordionGroup>
+  <Accordion title="pip install cannot find a specific version">
+    If `pip install mx8==X.Y.Z` fails with no matching distribution, the version may not be published yet.
+
+    Check available versions with:
+    ```bash
+    python -m pip index versions mx8
+    ```
+
+    Then install an available version, or publish the missing tag if you are the maintainer.
+  </Accordion>
+</AccordionGroup>
+
+## Cloud Storage Authentication
+
+<AccordionGroup>
+  <Accordion title="GCS ADC authentication failed">
+    If `gs://` loading fails with `GCS ADC authentication failed`, MX8 could not find Google Application Default Credentials.
+
+    Use one of:
+    - `GOOGLE_APPLICATION_CREDENTIALS=/path/to/service_account.json`
+    - `gcloud auth application-default login`
+    - GCE/GKE workload identity
+
+    ### Local Emulator Testing
+
+    For local emulator-only testing without cloud credentials, set both:
+    ```bash
+    MX8_GCS_ENDPOINT_URL=http://127.0.0.1:4443/storage/v1
+    MX8_GCS_ANONYMOUS=1
+    ```
+
+    <Warning>
+    `MX8_GCS_ANONYMOUS=1` requires `MX8_GCS_ENDPOINT_URL`.
+    </Warning>
+  </Accordion>
+
+  <Accordion title="Azure Blob authentication or emulator endpoint issues">
+    If `az://` loading fails with Azure auth errors, MX8 could not resolve usable credentials.
+
+    Use one of:
+    - `AZURE_STORAGE_CONNECTION_STRING=...`
+    - `AZURE_STORAGE_ACCOUNT=...` plus `AZURE_STORAGE_ACCESS_KEY=...`
+
+    ### Local Emulator Testing
+
+    For local emulator-only testing without credentials:
+    ```bash
+    MX8_AZURE_ENDPOINT_URL=http://127.0.0.1:10000/devstoreaccount1
+    MX8_AZURE_ANONYMOUS=1
+    ```
+
+    <Warning>
+    `MX8_AZURE_ANONYMOUS=1` requires `MX8_AZURE_ENDPOINT_URL`.
+    </Warning>
+  </Accordion>
+</AccordionGroup>
+
+## Decode and Vision Processing
+
+<AccordionGroup>
+  <Accordion title="Vision decode regression debugging">
+    To compare decode backends or validate Rust decode behavior, set `MX8_DECODE_BACKEND=rust` and configure the Rust path:
+
+    ```bash
+    MX8_DECODE_BACKEND=rust \
+    MX8_DECODE_THREADS=4 \
+    MX8_RUST_JPEG_CODEC=turbo \
+    MX8_RUST_RESIZE_BACKEND=fast \
+    python your_script.py
+    ```
+
+    The full decode environment surface is documented in the Python API reference. The default backend in v1.8 is Python/Pillow.
+  </Accordion>
+</AccordionGroup>
+
+## Expected Behaviors
+
+<AccordionGroup>
+  <Accordion title="Killed: 9 in demo2_minio.sh logs">
+    This is expected. The recovery gate script intentionally kills one agent process to verify lease expiry and requeue behavior.
+
+    The kill signal is part of the test, not an error.
+  </Accordion>
+</AccordionGroup>
+
+## Data Loading Issues
+
+<AccordionGroup>
+  <Accordion title="byte-aware batching requires byte_length">
+    If the loader fails with this message when `target_batch_bytes` or `max_batch_bytes` is set, your manifest rows are missing `byte_length` values.
+
+    Byte-aware batching requires both `byte_offset` and `byte_length` to be present in the manifest.
+
+    **Solutions:**
+    - Disable byte-aware batching, or
+    - Repack with explicit byte ranges
+  </Accordion>
+
+  <Accordion title="Process OOM protection">
+    MX8 loader surfaces set a default process RSS fail-fast cap. When the process RSS exceeds the cap, MX8 fails fast with a clear error message rather than waiting for the OS to OOM-kill it.
+
+    To set an explicit org-level cap:
+    ```bash
+    MX8_MAX_PROCESS_RSS_BYTES=<bytes>
+    ```
+
+    The error message will include the current RSS and the configured cap so you can adjust accordingly.
+  </Accordion>
+</AccordionGroup>
+
+## TUI Probe Failures
+
+<AccordionGroup>
+  <Accordion title="mx8-tui headless probe failures">
+    If the TUI exits with `lease panel remained empty`, `runtime panel remained empty`, or `manifest panel remained empty`, check the following.
+
+    ### Lease Panel
+    Verify the coordinator is reachable at `--coord-url` and that `--job-id` matches the active job.
+
+    ### Runtime Panel
+    Verify at least one agent is heartbeating. The runtime panel is built entirely from node heartbeat stats, so it stays empty if no agents have checked in.
+
+    ### Manifest Panel
+    Verify the manifest exists in the coordinator's `manifest_store`. Use `--manifest-path` to point the TUI at a local TSV file as a fallback.
+  </Accordion>
+</AccordionGroup>
+
+## Related Resources
+
+- [Production Runbook](/operations/production-runbook) - Production incident procedures
+- [High Availability](/operations/high-availability) - HA setup and failover
+- [Security](/operations/security) - Security model and best practices

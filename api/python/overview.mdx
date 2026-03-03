@@ -1,0 +1,216 @@
+---
+title: Python API Overview
+description: Python API for MX8 data loaders
+---
+
+The MX8 Python API provides high-performance data loaders for machine learning training and inference. Install with:
+
+```bash
+pip install mx8
+```
+
+For vision and training helpers, also install:
+
+```bash
+pip install pillow numpy torch
+```
+
+The current stable release is `mx8==1.0.5`.
+
+## Core Concepts
+
+### Loaders
+
+MX8 provides specialized loaders for different data types:
+
+- **`mx8.load`** - Core byte loader for raw data
+- **`mx8.text`** - Text loader with tokenization
+- **`mx8.image`** - Image loader with decode and augmentation
+- **`mx8.audio`** - Audio loader with decode and resampling
+- **`mx8.video`** - Video loader with clip extraction
+- **`mx8.mix`** - Mix multiple loaders with weighted sampling
+
+### Batch Interface
+
+All loaders return batches with:
+
+- `sample_ids` - Unique sample identifiers (int64)
+- `payload` - Raw bytes or decoded tensors
+- `offsets` - Byte offsets for variable-length samples
+
+Specialized loaders add domain-specific fields (e.g., `token_ids`, `attention_mask`, `label_ids`).
+
+### Distributed Training
+
+Built-in distributed support with automatic rank coordination:
+
+```python
+import mx8
+
+loader = mx8.load(
+    "s3://bucket/dataset/",
+    batch_size_samples=512,
+    max_ram_gb=24,
+    job_id="train-job-001",
+    cluster_url="http://coordinator:50051",
+)
+```
+
+Or use environment variables:
+
+```bash
+export MX8_JOB_ID=train-job-001
+export MX8_CLUSTER_URL=http://coordinator:50051
+```
+
+### Memory Management
+
+MX8 uses profile-based memory management:
+
+- **`safe`** - Conservative memory usage, lower throughput
+- **`balanced`** - Default balanced profile
+- **`throughput`** - Aggressive prefetching for maximum speed
+
+Set with the `profile` parameter:
+
+```python
+loader = mx8.load(
+    "s3://bucket/dataset/",
+    batch_size_samples=64,
+    max_ram_gb=12,
+    profile="balanced",
+)
+```
+
+### Multi-Epoch Training
+
+Loaders are **single-pass**. Create a new loader for each epoch:
+
+```python
+import mx8
+
+# Pin manifest to ensure same snapshot across epochs
+manifest_hash = mx8.resolve_manifest_hash("s3://bucket/train@refresh")
+pinned = f"s3://bucket/train@sha256:{manifest_hash}"
+
+for epoch in range(10):
+    loader = mx8.load(pinned, batch_size_samples=64, max_ram_gb=8)
+    for batch in loader:
+        train_step(batch)
+    loader.close()  # Optional but recommended
+```
+
+## Quick Examples
+
+### Basic Loading
+
+```python
+import mx8
+
+loader = mx8.load(
+    "s3://bucket/dataset/",
+    batch_size_samples=64,
+    max_ram_gb=12,
+)
+
+for batch in loader:
+    sample_ids = batch.sample_ids
+    payload = batch.payload
+    offsets = batch.offsets
+```
+
+### PyTorch Integration
+
+```python
+import mx8
+
+loader = mx8.load(
+    "s3://bucket/dataset/",
+    batch_size_samples=32,
+    max_ram_gb=4,
+)
+
+for batch in loader:
+    payload_u8, offsets_i64, sample_ids_i64 = batch.to_torch()
+    # Train your model
+```
+
+### Image Classification
+
+```python
+import mx8
+
+loader = mx8.image(
+    "s3://bucket/imagenet/train/@refresh",
+    augment="imagenet",
+    batch_size_samples=64,
+    max_ram_gb=12,
+    seed=42,
+    epoch=0,
+)
+
+for images, labels in loader:
+    # images: [B, 3, 224, 224] float32
+    # labels: [B] int64
+    train_step(images, labels)
+```
+
+### Text Generation
+
+```python
+import mx8
+
+loader = mx8.text(
+    "s3://bucket/corpus/",
+    tokenizer="gpt2",
+    sequence_length=2048,
+    stride=2048,
+    batch_size_samples=32,
+    max_ram_gb=12,
+)
+
+for batch in loader:
+    token_ids = batch.token_ids  # [B, 2048] int64
+    train_step(token_ids)
+```
+
+## API Reference
+
+<CardGroup cols={2}>
+  <Card title="Loaders" icon="database" href="/api/python/loaders">
+    Core loading functions for all data types
+  </Card>
+  <Card title="Packing" icon="box" href="/api/python/packing">
+    Dataset packing and manifest creation
+  </Card>
+  <Card title="Stats & Monitoring" icon="chart-line" href="/api/python/stats">
+    Pipeline metrics and monitoring
+  </Card>
+  <Card title="Checkpoint & Resume" icon="bookmark" href="/api/python/checkpoint">
+    Save and restore training progress
+  </Card>
+</CardGroup>
+
+## Environment Variables
+
+MX8 behavior can be configured via environment variables:
+
+| Variable | Description | Default |
+|----------|-------------|--------|
+| `MX8_CLUSTER_URL` | Coordinator URL for distributed mode | - |
+| `MX8_JOB_ID` | Job identifier for distributed mode | - |
+| `MX8_MANIFEST_STORE` | Local manifest cache directory | `~/.mx8/manifests` |
+| `MX8_MAX_PROCESS_RSS_BYTES` | Hard RSS memory cap | Derived from profile |
+| `MX8_PACK_PARALLEL_FETCHES` | S3 parallel fetch count during pack | 128 |
+| `MX8_PACK_PART_MB` | Multipart upload chunk size | 16 |
+| `MX8_DECODE_BACKEND` | Image decode backend (`python` or `rust`) | `python` |
+| `MX8_FFMPEG_BIN` | FFmpeg binary path for video decode | `ffmpeg` |
+| `MX8_VIDEO_DECODE_BACKEND` | Video decode backend (`cli` or `ffi`) | `cli` |
+
+## Version Support
+
+This documentation covers `mx8==1.0.5`. Install specific versions with:
+
+```bash
+pip install mx8==1.0.5
+```

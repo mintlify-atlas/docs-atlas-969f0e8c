@@ -1,0 +1,239 @@
+---
+title: User Guide
+description: Day-to-day usage patterns for MX8 loaders
+---
+
+This guide covers practical MX8 usage with the simple API surfaces for training, inference, and ETL workloads.
+
+## Core APIs
+
+MX8 provides focused APIs for common data loading scenarios:
+
+- `mx8.load` - Generic byte loader
+- `mx8.image` - Image loader with decode and augmentation
+- `mx8.video` - Video clip loader
+- `mx8.text` - Text tokenization loader
+- `mx8.audio` - Audio decode loader
+- `mx8.mix` - Weighted dataset mixing
+- `mx8.stats` - Human-readable loader health snapshot
+
+## Training Workflow
+
+<Steps>
+  <Step title="Start a loader">
+    ```python
+    import mx8
+
+    loader = mx8.load(
+        "s3://bucket/train@refresh",
+        batch_size_samples=512,
+        max_ram_gb=24,
+        profile="balanced",
+    )
+    ```
+
+    The `@refresh` suffix forces a fresh snapshot at job start. Use `@sha256:<hash>` to pin an exact snapshot.
+  </Step>
+
+  <Step title="Train and monitor">
+    ```python
+    for step, batch in enumerate(loader):
+        train_step(batch)
+        if step % 100 == 0:
+            print(mx8.stats(loader))
+    ```
+
+    Poll `mx8.stats(loader)` every N steps to track pipeline health, throughput, and memory usage.
+  </Step>
+
+  <Step title="Save checkpoints">
+    ```python
+    token = loader.checkpoint()
+    torch.save({"model": model.state_dict(), "mx8": token}, "ckpt.pt")
+    ```
+
+    The checkpoint token captures the loader's current position. Store it alongside your model checkpoint.
+  </Step>
+
+  <Step title="Resume after restart">
+    ```python
+    ckpt = torch.load("ckpt.pt")
+    model.load_state_dict(ckpt["model"])
+
+    loader = mx8.load(
+        "s3://bucket/train@refresh",
+        batch_size_samples=512,
+        max_ram_gb=24,
+        resume_from=ckpt["mx8"],
+    )
+    ```
+
+    Pass the saved token to `resume_from` to continue from the previous cursor position.
+  </Step>
+</Steps>
+
+### Distributed Training
+
+Attach to a distributed coordinator for multi-node training:
+
+```python
+loader = mx8.load(
+    "s3://bucket/train@refresh",
+    batch_size_samples=512,
+    max_ram_gb=24,
+    job_id="train-001",
+    cluster_url="http://coordinator-host:50051",
+)
+```
+
+<Note>
+Training is epoch-boundary elastic in v1. You can add/remove nodes between epochs. Mid-epoch rank loss requires restart + resume with the checkpoint token.
+</Note>
+
+On distributed resume, pass the same token content to all ranks:
+
+```python
+# All ranks load the same checkpoint
+ckpt = torch.load("ckpt.pt")
+loader = mx8.load(
+    "s3://bucket/train@refresh",
+    batch_size_samples=512,
+    max_ram_gb=24,
+    job_id="train-001",
+    cluster_url="http://coordinator-host:50051",
+    resume_from=ckpt["mx8"],
+)
+```
+
+## Inference and ETL Workflow
+
+<Steps>
+  <Step title="Start a loader">
+    ```python
+    import mx8
+
+    loader = mx8.load(
+        "s3://bucket/corpus/",
+        batch_size_samples=1024,
+        max_ram_gb=24,
+        profile="throughput",
+    )
+    ```
+
+    Use `profile="throughput"` to maximize pipeline depth for inference workloads.
+  </Step>
+
+  <Step title="Process and monitor">
+    ```python
+    for step, batch in enumerate(loader):
+        process(batch)
+        if step % 200 == 0:
+            print(mx8.stats(loader))
+    ```
+  </Step>
+
+  <Step title="Resume long jobs">
+    ```python
+    token = loader.checkpoint()
+
+    loader = mx8.load(
+        "s3://bucket/corpus/",
+        batch_size_samples=1024,
+        max_ram_gb=24,
+        resume_from=token,
+    )
+    ```
+
+    Inference and ETL have the strongest recovery path: lease reassignment plus checkpoint/resume.
+  </Step>
+</Steps>
+
+## Vision and Video
+
+### Image Loading
+
+```python
+loader = mx8.image(
+    "s3://bucket/images/",
+    batch_size_samples=64,
+    resize_hw=(224, 224),
+    max_ram_gb=24,
+)
+
+for images, labels in loader:
+    # images: [B, C, H, W] float32
+    # labels: [B] int64
+    pass
+```
+
+### Video Loading
+
+```python
+loader = mx8.video(
+    "s3://bucket/videos/",
+    clip_len=16,
+    stride=8,
+    fps=8,
+    batch_size_samples=32,
+    max_ram_gb=24,
+)
+
+for batch in loader:
+    clip_ids = batch.clip_ids
+    payload = batch.payload
+    offsets = batch.offsets
+```
+
+Both image and video loaders support `checkpoint()` and `resume_from` for recovery.
+
+## Dataset Mixing
+
+Blend multiple datasets with deterministic weighted sampling:
+
+```python
+a = mx8.load("s3://bucket/a/", batch_size_samples=32, max_ram_gb=12)
+b = mx8.load("s3://bucket/b/", batch_size_samples=32, max_ram_gb=12)
+
+mixed = mx8.mix(
+    [a, b],
+    weights=[0.7, 0.3],
+    seed=17,
+    epoch=0,
+    max_ram_gb=24,
+)
+```
+
+### Mix Resume Behavior
+
+- `mixed.checkpoint()` returns a mix token
+- On resume, if source checkpoints differ from token snapshots, mix continues in best-effort mode
+- Inspect `mixed.stats()["mix_resume_source_checkpoint_mismatch_total"]` to verify
+
+## Monitoring and Stats
+
+### Human-Readable Snapshot
+
+```python
+print(mx8.stats(loader))
+```
+
+Shows status, throughput, memory usage, and stability metrics.
+
+### Raw Counters
+
+```python
+raw = mx8.stats(loader, raw=True)
+print(raw["delivered_samples_total"])
+print(raw["process_rss_bytes"])
+print(raw["ram_high_water_bytes"])
+```
+
+## Operational Shortcuts
+
+<Card title="Full Incident Response" icon="book" href="/guides/monitoring">
+  See the monitoring guide for alert setup and troubleshooting steps
+</Card>
+
+<Card title="Distributed Setup" icon="server" href="/guides/deployment">
+  Deploy coordinator and agents for multi-node jobs
+</Card>

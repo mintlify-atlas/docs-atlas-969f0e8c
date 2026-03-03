@@ -1,0 +1,192 @@
+---
+title: mx8-coordinator
+description: Control plane server for MX8 distributed data pipelines
+---
+
+The `mx8-coordinator` binary is the control plane server that manages leases, dataset ownership, and membership for distributed MX8 jobs. It serves control-plane traffic and manifest bytes but never proxies dataset data bytes.
+
+## Usage
+
+```bash
+mx8-coordinator [OPTIONS]
+```
+
+All arguments can be provided via CLI flags or environment variables. Environment variables use the `MX8_` prefix.
+
+## Core Configuration
+
+### Network Binding
+
+| Flag | Environment Variable | Default | Description |
+|------|---------------------|---------|-------------|
+| `--addr` | `MX8_COORD_BIND_ADDR` | `0.0.0.0:50051` | gRPC bind address |
+| `--grpc-max-message-bytes` | `MX8_GRPC_MAX_MESSAGE_BYTES` | `67108864` | gRPC message size cap (64MB) |
+
+### Job Membership
+
+| Flag | Environment Variable | Default | Description |
+|------|---------------------|---------|-------------|
+| `--world-size` | `MX8_WORLD_SIZE` | `1` | Expected number of nodes (membership barrier) |
+| `--min-world-size` | `MX8_MIN_WORLD_SIZE` | `0` | Minimum nodes before issuing leases (defaults to `world_size`) |
+
+### Timing
+
+| Flag | Environment Variable | Default | Description |
+|------|---------------------|---------|-------------|
+| `--heartbeat-interval-ms` | `MX8_HEARTBEAT_INTERVAL_MS` | `1000` | Heartbeat cadence returned to agents |
+| `--lease-ttl-ms` | `MX8_LEASE_TTL_MS` | `10000` | How long before a silent lease expires |
+
+## Dataset Configuration
+
+| Flag | Environment Variable | Default | Description |
+|------|---------------------|---------|-------------|
+| `--dataset-link` | `MX8_DATASET_LINK` | unset | Dataset link: plain path, `@refresh`, or `@sha256:<hash>` |
+| `--manifest-store-root` | `MX8_MANIFEST_STORE_ROOT` | `~/.mx8/manifests` | Filesystem path or S3 prefix for manifest store |
+| `--manifest-hash` | `MX8_MANIFEST_HASH` | `dev` | Legacy pinned manifest hash (prefer `--dataset-link`) |
+
+## Development Options
+
+| Flag | Environment Variable | Default | Description |
+|------|---------------------|---------|-------------|
+| `--dev-manifest-path` | `MX8_DEV_MANIFEST_PATH` | unset | Path to TSV manifest for dev/test |
+| `--dev-total-samples` | `MX8_DEV_TOTAL_SAMPLES` | `0` | Dev-only synthetic sample count |
+| `--dev-block-size` | `MX8_DEV_BLOCK_SIZE` | `65536` | Dev-only work-range block size |
+
+## Snapshot Resolution
+
+| Flag | Environment Variable | Default | Description |
+|------|---------------------|---------|-------------|
+| `--snapshot-lock-stale-ms` | `MX8_SNAPSHOT_LOCK_STALE_MS` | `60000` | Stale threshold for snapshot locks |
+| `--snapshot-wait-timeout-ms` | `MX8_SNAPSHOT_WAIT_TIMEOUT_MS` | `30000` | Wait time for concurrent indexer |
+
+## Work Distribution
+
+| Flag | Environment Variable | Default | Description |
+|------|---------------------|---------|-------------|
+| `--shuffle` | `MX8_SHUFFLE` | `false` | Enable deterministic block shuffle |
+| `--seed` | `MX8_SEED` | `0` | Shuffle seed for deterministic ordering |
+| `--epoch` | `MX8_EPOCH` | `0` | Epoch input for deterministic ordering |
+
+## Durability & Recovery
+
+| Flag | Environment Variable | Default | Description |
+|------|---------------------|---------|-------------|
+| `--lease-log-path` | `MX8_LEASE_LOG_PATH` | `<manifest_store_root>/../lease_logs/<manifest_hash>.log` | Lease WAL path (`none` disables) |
+
+## High Availability
+
+| Flag | Environment Variable | Default | Description |
+|------|---------------------|---------|-------------|
+| `--ha-enable` | `MX8_COORD_HA_ENABLE` | `true` | Enable lease-file leader fencing |
+| `--ha-lease-path` | `MX8_COORD_HA_LEASE_PATH` | `<manifest_store_root>/../ha/<manifest_hash>.leader_lease` | Shared leader lease file |
+| `--ha-leader-id` | `MX8_COORD_HA_LEADER_ID` | `<hostname>-<pid>` | Coordinator identity for lease records |
+| `--ha-lease-ttl-ms` | `MX8_COORD_HA_LEASE_TTL_MS` | `5000` | Leader lease TTL |
+| `--ha-renew-interval-ms` | `MX8_COORD_HA_RENEW_INTERVAL_MS` | `1000` | Leader lease renew cadence |
+
+## State Store
+
+| Flag | Environment Variable | Default | Description |
+|------|---------------------|---------|-------------|
+| `--state-store-enable` | `MX8_COORD_STATE_STORE_ENABLE` | `true` | Enable durable shared state snapshots |
+| `--state-store-path` | `MX8_COORD_STATE_STORE_PATH` | `<manifest_store_root>/../state/<manifest_hash>.json` | Shared state snapshot file |
+
+## Observability
+
+| Flag | Environment Variable | Default | Description |
+|------|---------------------|---------|-------------|
+| `--metrics-snapshot-interval-ms` | `MX8_METRICS_SNAPSHOT_INTERVAL_MS` | `0` | Periodic metrics log interval (0 disables) |
+
+## Examples
+
+### Minimal local deployment
+
+```bash
+mx8-coordinator \
+  --addr 0.0.0.0:50051 \
+  --world-size 1 \
+  --dev-manifest-path ./manifest.tsv
+```
+
+### Production S3 deployment with HA
+
+```bash
+MX8_COORD_BIND_ADDR=0.0.0.0:50051 \
+MX8_WORLD_SIZE=16 \
+MX8_DATASET_LINK='s3://prod-bucket/datasets/train/@refresh' \
+MX8_MANIFEST_STORE_ROOT='s3://prod-bucket/mx8/manifests/' \
+MX8_COORD_HA_ENABLE=true \
+MX8_COORD_HA_LEASE_PATH='s3://prod-bucket/mx8/ha/train.leader_lease' \
+MX8_COORD_STATE_STORE_PATH='s3://prod-bucket/mx8/state/train.json' \
+mx8-coordinator
+```
+
+### Deterministic shuffle for training
+
+```bash
+mx8-coordinator \
+  --addr 0.0.0.0:50051 \
+  --world-size 8 \
+  --dataset-link 's3://bucket/train/@sha256:abc123' \
+  --manifest-store-root 's3://bucket/manifests/' \
+  --shuffle true \
+  --seed 42 \
+  --epoch 0
+```
+
+## Startup Order
+
+1. Build the coordinator binary:
+   ```bash
+   cargo build -p mx8-coordinator --features s3 --release
+   ```
+
+2. Start the coordinator:
+   ```bash
+   target/release/mx8-coordinator
+   ```
+
+3. Verify it's listening (check logs for bind confirmation)
+
+4. Start agents on each node pointing to the coordinator URL
+
+## Failure & Restart Behavior
+
+When the coordinator dies:
+
+- If HA is disabled: Agents lose connection and wait for coordinator restart
+- If HA is enabled: Another coordinator instance with shared lease/state paths takes over
+
+For HA to work correctly:
+
+- All coordinator instances must share `MX8_COORD_HA_LEASE_PATH`
+- All coordinator instances must share `MX8_COORD_STATE_STORE_PATH`
+- Paths must be on durable shared storage (S3 or network filesystem)
+
+Verify leader transition:
+
+```bash
+# Check coordinator logs for leadership acquisition
+grep "leader_lease_acquired" coordinator.log
+
+# Verify agents reconnect
+grep "heartbeat_ok" agent.log
+```
+
+## Production Checklist
+
+Before deploying to production:
+
+- [ ] Set `MX8_WORLD_SIZE` explicitly
+- [ ] Use `MX8_DATASET_LINK` with `@refresh` or `@sha256:` hash
+- [ ] Back `MX8_MANIFEST_STORE_ROOT` with S3 or durable storage
+- [ ] Enable HA with shared `MX8_COORD_HA_LEASE_PATH`
+- [ ] Enable state store with shared `MX8_COORD_STATE_STORE_PATH`
+- [ ] Set `MX8_GRPC_MAX_MESSAGE_BYTES` consistently across all components
+- [ ] Configure appropriate `MX8_LEASE_TTL_MS` for your failure recovery SLA
+- [ ] Run `./scripts/prod_readiness.sh` validation suite
+
+## Related
+
+- [Agent Reference](/api/cli/agent)
+- [TUI Reference](/api/cli/tui)
+- [CLI Overview](/api/cli/overview)

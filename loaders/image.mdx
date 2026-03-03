@@ -1,0 +1,421 @@
+---
+title: "Image Loader (mx8.image)"
+description: "Image decode and augmentation pipeline with built-in ImageNet presets"
+---
+
+## Overview
+
+`mx8.image()` delivers decoded images and labels as tensors. It supports resize, crop, augmentation, and normalization with deterministic reproducibility.
+
+## Basic Usage
+
+```python
+import mx8
+
+loader = mx8.image(
+    "s3://bucket/mx8/train/@refresh",
+    batch_size_samples=64,
+    max_ram_gb=12,
+    resize_hw=(224, 224),
+    profile="balanced",
+)
+
+print(loader.classes)  # ["cat", "dog", ...] or None
+
+for images, labels in loader:
+    # images: [B, C, H, W] float32
+    # labels: [B] int64
+    pass
+```
+
+## Parameters
+
+### Image Processing
+
+<ParamField path="resize_hw" type="tuple[int, int]">
+  `(height, width)` to resize all images before batching. If not set, images are returned at original size.
+</ParamField>
+
+<ParamField path="crop_hw" type="tuple[int, int]">
+  `(height, width)` for random crop after decode/resize
+</ParamField>
+
+<ParamField path="to_float" type="bool" default={true}>
+  Normalize pixel values to `float32` in `[0, 1]`. Set `False` for raw `uint8` tensors.
+</ParamField>
+
+### Augmentation
+
+<ParamField path="augment" type="str">
+  Preset alias. `"imagenet"` or `"standard"` applies:
+  - `resize_hw=(256, 256)` (if not set)
+  - `crop_hw=(224, 224)`
+  - `horizontal_flip_p=0.5`
+  - `color_jitter_brightness=0.4`
+  - `color_jitter_contrast=0.4`
+  - `color_jitter_saturation=0.4`
+  - ImageNet normalization: `mean=(0.485, 0.456, 0.406)`, `std=(0.229, 0.224, 0.225)`
+</ParamField>
+
+<ParamField path="horizontal_flip_p" type="float" default={0.0}>
+  Per-sample horizontal flip probability in `[0, 1]`
+</ParamField>
+
+<ParamField path="color_jitter_brightness" type="float" default={0.0}>
+  Brightness jitter magnitude (non-negative)
+</ParamField>
+
+<ParamField path="color_jitter_contrast" type="float" default={0.0}>
+  Contrast jitter magnitude (non-negative)
+</ParamField>
+
+<ParamField path="color_jitter_saturation" type="float" default={0.0}>
+  Saturation jitter magnitude (non-negative)
+</ParamField>
+
+<ParamField path="color_jitter_hue" type="float" default={0.0}>
+  Hue jitter magnitude. Currently only `0.0` is accepted (not yet implemented).
+</ParamField>
+
+<ParamField path="normalize_mean" type="tuple[float, float, float]">
+  Per-channel normalization mean. Must be used together with `normalize_std`.
+</ParamField>
+
+<ParamField path="normalize_std" type="tuple[float, float, float]">
+  Per-channel normalization standard deviation. All values must be `> 0`.
+</ParamField>
+
+### Determinism
+
+<ParamField path="seed" type="int">
+  Random seed for augmentation. For fixed `manifest_hash`, `seed`, `epoch`, and `sample_id`, augmentation is reproducible.
+</ParamField>
+
+<ParamField path="epoch" type="int">
+  Epoch number for deterministic augmentation (used with `seed`)
+</ParamField>
+
+### Dataset & Memory
+
+<ParamField path="dataset_link" type="str" required>
+  Path or S3 prefix to image dataset
+</ParamField>
+
+<ParamField path="batch_size_samples" type="int" required>
+  Number of images per batch
+</ParamField>
+
+<ParamField path="max_ram_gb" type="int | float" required>
+  Memory budget
+</ParamField>
+
+<ParamField path="profile" type="str" default="balanced">
+  Safety/throughput preset: `"safe"`, `"balanced"`, or `"throughput"`
+</ParamField>
+
+<ParamField path="manifest_store" type="str" default="~/.mx8/manifests">
+  Manifest store root
+</ParamField>
+
+<ParamField path="manifest_path" type="str">
+  Override with local manifest TSV
+</ParamField>
+
+<ParamField path="recursive" type="bool" default={true}>
+  Index subdirectories recursively
+</ParamField>
+
+<ParamField path="start_id" type="int">
+  Starting sample ID
+</ParamField>
+
+<ParamField path="end_id" type="int">
+  Ending sample ID (exclusive)
+</ParamField>
+
+<ParamField path="autopack" type="bool" default={false}>
+  Auto-pack if no manifest exists
+</ParamField>
+
+<ParamField path="autopack_shard_mb" type="int" default={512}>
+  Shard size for auto-packing
+</ParamField>
+
+### Distributed Execution
+
+<ParamField path="job_id" type="str">
+  Job identifier for distributed mode
+</ParamField>
+
+<ParamField path="cluster_url" type="str">
+  Coordinator URL
+</ParamField>
+
+<ParamField path="node_id" type="str">
+  Node identity (defaults to `rank{RANK}` in distributed mode)
+</ParamField>
+
+<ParamField path="resume_from" type="str">
+  Checkpoint token from `loader.checkpoint()`
+</ParamField>
+
+## Usage Patterns
+
+<Tabs>
+  <Tab title="Basic Classification">
+    ```python
+    import mx8
+
+    loader = mx8.image(
+        "s3://bucket/train/",
+        batch_size_samples=64,
+        resize_hw=(224, 224),
+        max_ram_gb=12,
+    )
+
+    for images, labels in loader:
+        # images: [64, 3, 224, 224] float32 in [0, 1]
+        # labels: [64] int64
+        logits = model(images)
+        loss = criterion(logits, labels)
+    ```
+  </Tab>
+
+  <Tab title="ImageNet Augmentation">
+    ```python
+    import mx8
+
+    loader = mx8.image(
+        "s3://bucket/train/@refresh",
+        augment="imagenet",
+        batch_size_samples=64,
+        max_ram_gb=12,
+        seed=42,
+        epoch=0,
+    )
+
+    for images, labels in loader:
+        # Images are:
+        # - Resized to 256x256
+        # - Random cropped to 224x224
+        # - Randomly flipped (p=0.5)
+        # - Color jittered
+        # - Normalized with ImageNet stats
+        logits = model(images)
+    ```
+  </Tab>
+
+  <Tab title="Custom Augmentation">
+    ```python
+    import mx8
+
+    loader = mx8.image(
+        "s3://bucket/train/",
+        batch_size_samples=64,
+        resize_hw=(256, 256),
+        crop_hw=(224, 224),
+        horizontal_flip_p=0.5,
+        color_jitter_brightness=0.2,
+        color_jitter_contrast=0.2,
+        color_jitter_saturation=0.2,
+        normalize_mean=(0.5, 0.5, 0.5),
+        normalize_std=(0.5, 0.5, 0.5),
+        seed=42,
+        max_ram_gb=12,
+    )
+
+    for images, labels in loader:
+        train_step(images, labels)
+    ```
+  </Tab>
+
+  <Tab title="Multi-Epoch Training">
+    ```python
+    import mx8
+
+    # Pin snapshot once
+    manifest_hash = mx8.resolve_manifest_hash("s3://bucket/train@refresh")
+    pinned = f"s3://bucket/train@sha256:{manifest_hash}"
+
+    for epoch in range(100):
+        loader = mx8.image(
+            pinned,
+            augment="imagenet",
+            batch_size_samples=64,
+            max_ram_gb=12,
+            seed=42,
+            epoch=epoch,  # Different augmentation each epoch
+        )
+        
+        for images, labels in loader:
+            train_step(images, labels)
+    ```
+  </Tab>
+
+  <Tab title="Raw uint8 Output">
+    ```python
+    import mx8
+
+    loader = mx8.image(
+        "s3://bucket/train/",
+        batch_size_samples=64,
+        resize_hw=(224, 224),
+        to_float=False,  # Return uint8
+        max_ram_gb=12,
+    )
+
+    for images, labels in loader:
+        # images: [64, 3, 224, 224] uint8 in [0, 255]
+        # Apply custom preprocessing
+        images_float = images.float() / 255.0
+    ```
+  </Tab>
+
+  <Tab title="Validation (No Augmentation)">
+    ```python
+    import mx8
+
+    loader = mx8.image(
+        "s3://bucket/val/",
+        batch_size_samples=64,
+        resize_hw=(224, 224),
+        normalize_mean=(0.485, 0.456, 0.406),
+        normalize_std=(0.229, 0.224, 0.225),
+        max_ram_gb=12,
+        # No augmentation for validation
+    )
+
+    for images, labels in loader:
+        with torch.no_grad():
+            logits = model(images)
+            acc = compute_accuracy(logits, labels)
+    ```
+  </Tab>
+</Tabs>
+
+## Augmentation Pipeline
+
+Augmentation order is fixed and deterministic:
+
+1. **Decode** — read and decode JPEG/PNG
+2. **Resize** — resize to `resize_hw` (if set)
+3. **Crop** — random crop to `crop_hw` (if set)
+4. **Flip** — horizontal flip with probability `horizontal_flip_p`
+5. **Jitter** — color jitter (brightness, contrast, saturation)
+6. **Normalize** — apply `normalize_mean` and `normalize_std`
+
+```python
+loader = mx8.image(
+    "s3://bucket/train/",
+    batch_size_samples=64,
+    resize_hw=(256, 256),      # Step 2
+    crop_hw=(224, 224),         # Step 3
+    horizontal_flip_p=0.5,      # Step 4
+    color_jitter_brightness=0.4,  # Step 5
+    normalize_mean=(0.485, 0.456, 0.406),  # Step 6
+    normalize_std=(0.229, 0.224, 0.225),
+    max_ram_gb=12,
+)
+```
+
+## Label Classes
+
+Access class names via `loader.classes`:
+
+```python
+loader = mx8.image(
+    "s3://bucket/imagenet/train/",
+    batch_size_samples=64,
+    max_ram_gb=12,
+)
+
+print(loader.classes)
+# ["n01440764", "n01443537", ...] or None if no labels
+
+for images, labels in loader:
+    for label_idx in labels:
+        class_name = loader.classes[label_idx]
+        print(f"Label: {class_name}")
+```
+
+## Decode Backend
+
+The default backend in `mx8==1.0.5` is Python/Pillow.
+
+To use experimental Rust decode:
+
+```bash
+export MX8_DECODE_BACKEND=rust
+export MX8_DECODE_THREADS=8
+export MX8_RUST_JPEG_CODEC=zune  # or 'image', 'turbo'
+export MX8_RUST_RESIZE_BACKEND=fast  # or 'image'
+```
+
+## Stats & Monitoring
+
+```python
+stats = loader.stats()
+
+print(stats["delivered_samples_total"])
+print(stats["ram_high_water_bytes"])
+print(stats["process_rss_bytes"])
+```
+
+## Checkpoint & Resume
+
+```python
+import mx8
+
+loader = mx8.image(
+    "s3://bucket/train/",
+    augment="imagenet",
+    batch_size_samples=64,
+    max_ram_gb=12,
+    seed=42,
+)
+
+for step, (images, labels) in enumerate(loader):
+    train_step(images, labels)
+    
+    if step % 1000 == 0:
+        token = loader.checkpoint()
+        save_checkpoint(model, token)
+
+# Resume
+loader = mx8.image(
+    "s3://bucket/train/",
+    augment="imagenet",
+    batch_size_samples=64,
+    max_ram_gb=12,
+    seed=42,
+    resume_from=token,
+)
+```
+
+## Best Practices
+
+<Check>
+**Pin `seed` and increment `epoch` for reproducible multi-epoch augmentation** — ensures different augmentation each epoch
+</Check>
+
+<Check>
+**Use `augment="imagenet"` for standard ImageNet training** — applies proven augmentation defaults
+</Check>
+
+<Check>
+**Disable augmentation for validation** — only use resize and normalization
+</Check>
+
+<Check>
+**Set `to_float=False` for custom preprocessing pipelines** — gives you raw uint8 control
+</Check>
+
+<Warning>
+**All images in a batch must have the same dimensions** — mixed-size batches are rejected
+</Warning>
+
+## See Also
+
+- [Byte Loader](/loaders/bytes) - Raw byte streaming
+- [Mix API](/loaders/mix) - Blend multiple image datasets
+- Gate tests: `./scripts/image_aug_gate.sh`, `./scripts/py_local_image_pillow_gate.sh`, `./scripts/py_minio_image_pillow_gate.sh`

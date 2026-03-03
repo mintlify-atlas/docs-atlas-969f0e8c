@@ -1,0 +1,237 @@
+---
+title: System Architecture
+description: Understanding MX8's distributed data runtime and authority layer
+---
+
+MX8 is a high-performance Rust in-process data runtime (exposed to Python) plus a small, per-job distributed authority layer. It keeps the hot-path (fetch/decode/pack/deliver) **in-process and bounded**, while centralizing cluster-level decisions (ownership, pacing) so multi-node behaves like **one coordinated consumer**, not many independent loaders.
+
+## Design Goals
+
+MX8 v1.8 is optimized for offline inference, ETL, preprocessing, and large corpus processing:
+
+- Stop "each node pulls independently" by introducing a tiny cluster authority layer
+- Stable throughput with no synchronized bursts or oscillation
+- Bounded memory with hard caps and backpressure (no RAM blowups)
+- Deterministic sharding for a pinned snapshot when failure-free
+- Kill-a-node recovery for inference/ETL via leases, cursors, and reassignment
+
+<Note>
+Training is supported as a consumer (stability/throughput), but v1.8 does not keep DDP alive after node failure. Membership changes between epochs are supported via restart.
+</Note>
+
+## Three-Layer Architecture
+
+MX8 separates concerns across three distinct components:
+
+### A) `mx8` Runtime (In-Process)
+
+The Rust runtime is embedded in your Python process and handles the hot path:
+
+- Bounded pipeline stages: Fetch → Decode/Parse → Pack → Deliver
+- Local planner consumes `WorkRange`s but does not decide global ownership
+- Metrics: samples/sec, bytes/sec, stage p50/p95, queue depths, RAM high-water mark
+
+```python
+import mx8
+
+loader = mx8.load(
+    "s3://bucket/dataset/",
+    batch_size_samples=64,
+    max_ram_gb=12,
+    profile="balanced",
+)
+
+for batch in loader:
+    process(batch.payload, batch.offsets)
+```
+
+### B) `mx8d-agent` (Per-Node Daemon)
+
+The agent runs one per node and enforces local authority:
+
+- Local authority for budgets and feeding work to runtimes on the machine
+- Enforces per-node limits (fetch concurrency, inflight bytes, memory caps)
+- Talks to coordinator for leases/heartbeats/progress
+- Hands subranges to local processes/ranks (node is the scheduling unit in v1.8)
+
+### C) `mx8-coordinator` (Per-Job Leader)
+
+The coordinator runs one per job and handles cluster-wide decisions:
+
+- Resolves dataset link to a **pinned snapshot** (`manifest_hash`)
+- Freezes membership for the run (barrier to `world_size`)
+- Assigns leases for `WorkRange`s, expires leases, requeues remainders
+- Applies simple cluster-wide caps via lease issuance
+
+## Component View
+
+```
+┌──────────────────────────┐        local RPC         ┌──────────────────────────┐        RPC         ┌──────────────────────────┐
+│      User Process         │  (unix / localhost)      │           Node           │   (HTTP / gRPC)    │           Job            │
+│                          │◀────────────────────────▶│                          │◀──────────────────▶│                          │
+│  Python code              │                          │  mx8d-agent (daemon)     │                    │  mx8-coordinator         │
+│  + mx8 runtime (Rust)     │                          │  - local caps/budgets    │                    │  - leases/ownership      │
+│  - bounded pipeline       │                          │  - feeds WorkRanges      │                    │  - resolves snapshots    │
+└─────────────┬────────────┘                          └──────────────────────────┘                    └─────────────┬────────────┘
+              │                                                                                                        │
+              │ DATA bytes (direct)                                                                                   │ read/write
+              ▼                                                                                                        ▼
+┌──────────────────────────┐                                                                             ┌──────────────────────────┐
+│      Dataset Storage       │                                                                             │       manifest_store       │
+│  S3 / NVMe / filesystem    │                                                                             │  S3 prefix or FS path      │
+└──────────────────────────┘                                                                             └──────────────────────────┘
+
+Note: If an agent cannot fetch the manifest URL directly (e.g., FS path not shared),
+      the coordinator can proxy *manifest bytes by manifest_hash* (never dataset data).
+```
+
+<Info>
+**Control plane vs. data plane:** The coordinator only serves control-plane traffic and manifest bytes. It never proxies dataset data bytes. Agents and runtimes fetch data directly from storage.
+</Info>
+
+## Core Invariants
+
+MX8 guarantees the following invariants across all deployments:
+
+1. **No overlap**: a sample ID belongs to at most one *live* lease at a time
+2. **Bounded memory**: every pipeline stage has hard caps; backpressure prevents runaway prefetch
+3. **Deterministic (failure-free)**: for a pinned snapshot `(manifest_hash)` and `(seed, epoch, world_size, frozen membership)`, sharding/assignment is deterministic
+4. **Recovery**: if a node dies, unfinished portion of its lease can be reassigned (inference/ETL)
+
+## Data Model
+
+### Manifest (Pinned Snapshot)
+
+Everything is a global sample ID space. Files/objects are implementation detail.
+
+- `sample_id: u64` in `[0..N)`
+- Record contains at least:
+  - location (path/key)
+  - byte offsets/lengths when applicable
+  - decode hints (optional; may include lightweight semantics like ImageFolder label IDs)
+
+v1.8 manifest format: **canonical TSV** (`_mx8/manifest.tsv` for packed datasets), with a **canonical hashing rule** for `manifest_hash` (hash the canonical record stream + schema version; do not rely on raw file bytes).
+
+### WorkRange (Unit of Assignment)
+
+Contiguous physical ID interval in pinned sample-ID space:
+
+```rust
+WorkRange {
+    start_id: u64,
+    end_id: u64,  // half-open
+    epoch: u32,
+    seed: u64
+}
+```
+
+Shuffle in v1.8 is block-based in physical ID space:
+- Split `[0..N)` into blocks (e.g., 64k–1M samples)
+- Shuffle block order deterministically by `(seed, epoch)`
+- Iterate sequentially within a block (or tiny local shuffle)
+
+### Lease (Temporary Ownership)
+
+```rust
+Lease {
+    lease_id,
+    node_id,
+    range: WorkRange,
+    expires_at,
+    cursor
+}
+```
+
+<Warning>
+**Cursor semantics:** Cursor advances only after **DELIVER** (batch handed to Python/consumer), not after fetch or decode. This ensures at-least-once delivery semantics at boundaries.
+</Warning>
+
+## High Availability (Default in v1.8.7)
+
+Default mode: leader-fenced coordinator with durable shared state replay enabled.
+
+- HA can be explicitly disabled with `MX8_COORD_HA_ENABLE=0`
+- Operator requirement: shared durable lease/state paths (`MX8_COORD_HA_LEASE_PATH`, `MX8_COORD_STATE_STORE_PATH`) across coordinator candidates
+
+### Dynamic Membership (v1.8.2+)
+
+The coordinator supports elastic membership changes after the initial barrier is met:
+
+- **`--min-world-size`**: job starts when this many nodes register. Defaults to `world_size`
+- **Departed nodes**: when a node's heartbeat expires, it's added to `departed_nodes` and its unissued ranges return to the global pool
+- **Replacement nodes**: a new node ID may register after freeze if a slot is vacant
+- **Scale-out nodes**: if no slot is vacant and current membership is below configured `world_size`, a new node is admitted
+- **Same-identity recovery**: a node that briefly loses connectivity and re-registers with the same ID is un-departed and resumes its original rank
+
+<Note>
+**Determinism note:** Fixed-membership runs are deterministic. Any post-freeze membership change (replacement or scale-out) may reorder unissued work at the boundary.
+</Note>
+
+## Control Loops
+
+### Coordinator Loop (~1s)
+
+- Expire leases for nodes missing heartbeats
+- Requeue unfinished remainder ranges `[cursor, end)`
+- Grant new leases (fairness: simple RR/FIFO; obey caps)
+
+### Agent Loop (~200ms)
+
+- Heartbeat to coordinator with node stats
+- If local runtime has capacity, request leases
+- Hand ranges to local runtimes; report progress cursor periodically
+
+### Runtime Loop
+
+- Get next range from local agent
+- Fetch/decode/pack/deliver with bounded queues + backpressure
+
+## Protocol Overview
+
+<Accordion title="Agent → Coordinator">
+- `RegisterNode(node_id, caps)`
+- `Heartbeat(node_id, stats)`
+- `RequestLease(node_id, want)`
+- `ReportProgress(node_id, lease_id, cursor)`
+</Accordion>
+
+<Accordion title="Coordinator → Agent">
+- `LeaseGranted(lease)`
+- `NoLease(wait_ms)`
+- `GetManifest(manifest_hash)` (manifest proxy fallback; optional)
+</Accordion>
+
+<Accordion title="Process → Agent (localhost / unix socket)">
+- `RegisterWorker(job_id, process_id, demand_hint)`
+- `GetNextRange(job_id) -> WorkRange`
+- `ReportLocalStats(job_id, stats)`
+</Accordion>
+
+## Workload Scope
+
+v1.8 primary workloads:
+
+- Offline inference
+- ETL / preprocessing
+- Large corpus processing
+
+Training support:
+- **Epoch-boundary elasticity only**: membership changes (add/remove nodes) are supported between epochs via restart
+- **Mid-epoch rank loss**: still non-elastic (DDP process group fails; restart required)
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Memory Contract" icon="memory" href="/concepts/memory-contract">
+    Learn about memory guarantees and RSS caps
+  </Card>
+  <Card title="Manifests & Snapshots" icon="camera" href="/concepts/manifests-and-snapshots">
+    Understand dataset pinning and versioning
+  </Card>
+  <Card title="Distributed Execution" icon="network-wired" href="/concepts/distributed-execution">
+    Deep dive into coordinator/agent model
+  </Card>
+  <Card title="Deployment Guide" icon="rocket" href="/guides/deployment">
+    Deploy your first distributed job
+  </Card>
+</CardGroup>

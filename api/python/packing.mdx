@@ -1,0 +1,262 @@
+---
+title: Packing Functions
+description: Dataset packing and manifest generation
+---
+
+Before loading data at production scale, pack your dataset once to create precomputed tar shards and a manifest. MX8 uses these for all subsequent runs.
+
+## mx8.pack
+
+Pack an S3 prefix into tar shards.
+
+```python
+mx8.pack(
+    pack_in,
+    out="s3://bucket/packed/",
+    shard_mb=512,
+)
+```
+
+### Parameters
+
+<ParamField path="pack_in" type="str" required>
+  Source S3 prefix to pack (e.g., `"s3://bucket/raw/"`).
+</ParamField>
+
+<ParamField path="out" type="str" required>
+  Destination S3 prefix for packed shards and manifest.
+</ParamField>
+
+<ParamField path="shard_mb" type="int" default="512">
+  Target shard size in megabytes.
+</ParamField>
+
+<ParamField path="label_mode" type="str" default="auto">
+  Label detection mode:
+  - `"auto"` - Automatically detect labels from directory structure
+  - `"none"` - No labels
+  - `"imagefolder"` - ImageFolder-style labels (subdirectory names)
+</ParamField>
+
+<ParamField path="require_labels" type="bool" default="False">
+  Fail if labels are not found.
+</ParamField>
+
+<ParamField path="parallel_fetches" type="int" default="128">
+  Number of concurrent S3 GET requests. Can be overridden with `MX8_PACK_PARALLEL_FETCHES` environment variable.
+</ParamField>
+
+### Example
+
+```python
+import mx8
+
+# Pack raw S3 data into shards
+mx8.pack(
+    "s3://my-bucket/raw-data/",
+    out="s3://my-bucket/packed/",
+    shard_mb=512,
+    label_mode="auto",
+)
+
+# Now load from packed dataset
+loader = mx8.load(
+    "s3://my-bucket/packed/",
+    batch_size_samples=64,
+    max_ram_gb=12,
+)
+```
+
+<Note>
+  Packing is a one-time operation. Subsequent runs automatically use the existing packed shards and manifest.
+</Note>
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|--------|
+| `MX8_PACK_PARALLEL_FETCHES` | Concurrent S3 GET requests | 128 |
+| `MX8_PACK_PART_MB` | Multipart upload chunk size | 16 |
+
+---
+
+## mx8.pack_dir
+
+Pack a local directory into tar shards.
+
+```python
+mx8.pack_dir(
+    in_dir="/local/data/",
+    out="s3://bucket/packed/",
+    shard_mb=512,
+)
+```
+
+### Parameters
+
+<ParamField path="in_dir" type="str" required>
+  Source local directory to pack.
+</ParamField>
+
+<ParamField path="out" type="str" required>
+  Destination S3 prefix for packed shards and manifest.
+</ParamField>
+
+<ParamField path="shard_mb" type="int" default="512">
+  Target shard size in megabytes.
+</ParamField>
+
+<ParamField path="label_mode" type="str" default="auto">
+  Label detection mode: `"auto"`, `"none"`, or `"imagefolder"`.
+</ParamField>
+
+<ParamField path="require_labels" type="bool" default="False">
+  Fail if labels are not found.
+</ParamField>
+
+### Example
+
+```python
+import mx8
+
+# Pack local ImageFolder-style dataset
+mx8.pack_dir(
+    in_dir="/data/imagenet/train/",
+    out="s3://my-bucket/imagenet-packed/",
+    shard_mb=512,
+    label_mode="imagefolder",
+)
+
+# Load from packed dataset
+loader = mx8.image(
+    "s3://my-bucket/imagenet-packed/",
+    batch_size_samples=64,
+    max_ram_gb=12,
+)
+```
+
+---
+
+## mx8.resolve_manifest_hash
+
+Resolve a dataset link to its pinned manifest hash without starting a loader.
+
+```python
+manifest_hash = mx8.resolve_manifest_hash(
+    dataset_link,
+    manifest_store=None,
+)
+```
+
+### Parameters
+
+<ParamField path="dataset_link" type="str" required>
+  Dataset path or S3 prefix. Supports `@refresh` and `@sha256:<hash>` suffixes.
+</ParamField>
+
+<ParamField path="manifest_store" type="str" default="None">
+  Local manifest cache directory. Defaults to `~/.mx8/manifests`.
+</ParamField>
+
+<ParamField path="manifest_path" type="str" default="None">
+  Path to local manifest TSV for development/override flows.
+</ParamField>
+
+<ParamField path="recursive" type="bool" default="True">
+  Index subdirectories recursively.
+</ParamField>
+
+<ParamField path="node_id" type="str" default="None">
+  Node identity for proof logs.
+</ParamField>
+
+### Returns
+
+<ResponseField name="manifest_hash" type="str">
+  Pinned manifest hash (e.g., `"abc123..."`).
+</ResponseField>
+
+### Example
+
+```python
+import mx8
+
+# Resolve once to capture dataset state
+manifest_hash = mx8.resolve_manifest_hash("s3://bucket/train@refresh")
+pinned = f"s3://bucket/train@sha256:{manifest_hash}"
+
+# Use pinned hash for all epochs (ensures same snapshot)
+for epoch in range(10):
+    loader = mx8.load(
+        pinned,
+        batch_size_samples=64,
+        max_ram_gb=8,
+    )
+    for batch in loader:
+        train_step(batch)
+    loader.close()
+```
+
+<Tip>
+  Pin manifest hashes at the start of multi-epoch training to ensure every epoch sees the exact same snapshot, even if the source dataset changes.
+</Tip>
+
+---
+
+## Autopack
+
+All loaders support automatic packing via the `autopack` parameter:
+
+```python
+loader = mx8.load(
+    "s3://bucket/raw-data/",  # Unpacked S3 prefix
+    batch_size_samples=64,
+    max_ram_gb=12,
+    autopack=True,
+    autopack_shard_mb=512,
+)
+```
+
+When `autopack=True` and the dataset has no manifest:
+1. MX8 runs a full pack in-place before starting the loader
+2. Packed shards and manifest are written to the same prefix
+3. Subsequent runs skip the pack step automatically
+
+<ParamField path="autopack" type="bool" default="False">
+  Automatically pack unpacked datasets on first run.
+</ParamField>
+
+<ParamField path="autopack_shard_mb" type="int" default="512">
+  Shard size in MB when autopacking.
+</ParamField>
+
+### Example
+
+```python
+import mx8
+
+# First run: packs dataset automatically
+loader = mx8.text(
+    "s3://bucket/corpus/",
+    tokenizer="gpt2",
+    sequence_length=2048,
+    stride=2048,
+    batch_size_samples=32,
+    max_ram_gb=12,
+    autopack=True,
+)
+
+# Subsequent runs: uses existing packed shards
+loader = mx8.text(
+    "s3://bucket/corpus/",
+    tokenizer="gpt2",
+    sequence_length=2048,
+    stride=2048,
+    batch_size_samples=32,
+    max_ram_gb=12,
+)
+```
+
+<Warning>
+  Autopack is convenient for development but adds latency on first run. For production, prefer explicit `mx8.pack()` or `mx8.pack_dir()` as a separate preprocessing step.
+</Warning>

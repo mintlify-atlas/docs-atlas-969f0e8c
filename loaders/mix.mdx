@@ -1,0 +1,414 @@
+---
+title: "Mix API (mx8.mix)"
+description: "Deterministic multi-dataset blending with weighted sampling and shared memory envelope"
+---
+
+## Overview
+
+`mx8.mix()` blends multiple loaders deterministically under one shared memory envelope. Use it to train on weighted combinations of datasets without managing interleaving yourself.
+
+## Basic Usage
+
+```python
+import mx8
+
+loader_a = mx8.load("s3://bucket/a@refresh", batch_size_samples=32, max_ram_gb=6)
+loader_b = mx8.load("s3://bucket/b@refresh", batch_size_samples=32, max_ram_gb=6)
+
+mixed = mx8.mix(
+    [loader_a, loader_b],
+    weights=[0.7, 0.3],
+    seed=17,
+    epoch=3,
+    source_exhausted="error",
+    max_ram_gb=12,
+    profile="balanced",
+)
+
+for batch in mixed:
+    train_step(batch)
+```
+
+## Parameters
+
+### Source Loaders
+
+<ParamField path="loaders" type="list" required>
+  List of source loaders. Accepts loaders created by `mx8.load(...)` and `mx8.DistributedDataLoader(...)`.
+</ParamField>
+
+<ParamField path="weights" type="list[float]" required>
+  List of positive floats for weighted sampling. Values are normalized internally.
+</ParamField>
+
+### Determinism
+
+<ParamField path="seed" type="int" required>
+  Random seed for deterministic scheduling
+</ParamField>
+
+<ParamField path="epoch" type="int" required>
+  Epoch number for deterministic interleaving (used with `seed`)
+</ParamField>
+
+### Exhaustion Policy
+
+<ParamField path="source_exhausted" type="str" default="error">
+  Behavior when a source runs out:
+  - `"error"`: fail fast (default)
+  - `"allow"`: drain remaining sources
+</ParamField>
+
+<ParamField path="starvation_window" type="int">
+  Starvation accounting window for scheduler
+</ParamField>
+
+### Memory Management
+
+<ParamField path="max_ram_gb" type="int | float" required>
+  Memory budget for the mixed loader. All sources share one inflight cap — backpressure is global.
+</ParamField>
+
+<ParamField path="profile" type="str" default="balanced">
+  Safety/throughput preset: `"safe"`, `"balanced"`, or `"throughput"`
+</ParamField>
+
+### Checkpoint & Resume
+
+<ParamField path="resume_from" type="str">
+  Checkpoint token from `mixed.checkpoint()`. Resume contract:
+  - `seed`, `epoch`, and source count must match
+  - Restores scheduler position and per-source delivery counters
+  - If source checkpoints differ, continues in best-effort mode and increments `mix_resume_source_checkpoint_mismatch_total`
+</ParamField>
+
+<ParamField path="job_id" type="str">
+  Job identifier (accepted for API consistency, currently ignored)
+</ParamField>
+
+<ParamField path="cluster_url" type="str">
+  Coordinator URL (accepted for API consistency, currently ignored)
+</ParamField>
+
+## Usage Patterns
+
+<Tabs>
+  <Tab title="Basic Mixing">
+    ```python
+    import mx8
+
+    # 70% dataset A, 30% dataset B
+    loader_a = mx8.load("s3://bucket/a/", batch_size_samples=32, max_ram_gb=6)
+    loader_b = mx8.load("s3://bucket/b/", batch_size_samples=32, max_ram_gb=6)
+
+    mixed = mx8.mix(
+        [loader_a, loader_b],
+        weights=[0.7, 0.3],
+        seed=42,
+        epoch=0,
+        max_ram_gb=12,
+    )
+
+    for batch in mixed:
+        train_step(batch)
+    ```
+  </Tab>
+
+  <Tab title="Multi-Dataset Training">
+    ```python
+    import mx8
+
+    # Mix three datasets with different weights
+    common = mx8.load("s3://bucket/common/", batch_size_samples=32, max_ram_gb=4)
+    rare = mx8.load("s3://bucket/rare/", batch_size_samples=32, max_ram_gb=4)
+    validation = mx8.load("s3://bucket/val/", batch_size_samples=32, max_ram_gb=4)
+
+    mixed = mx8.mix(
+        [common, rare, validation],
+        weights=[0.7, 0.25, 0.05],  # Oversample rare, small validation mix
+        seed=17,
+        epoch=0,
+        max_ram_gb=12,
+    )
+
+    for batch in mixed:
+        train_step(batch)
+    ```
+  </Tab>
+
+  <Tab title="Multi-Epoch with Determinism">
+    ```python
+    import mx8
+
+    # Pin snapshots for reproducibility
+    hash_a = mx8.resolve_manifest_hash("s3://bucket/a@refresh")
+    hash_b = mx8.resolve_manifest_hash("s3://bucket/b@refresh")
+    
+    pinned_a = f"s3://bucket/a@sha256:{hash_a}"
+    pinned_b = f"s3://bucket/b@sha256:{hash_b}"
+
+    seed = 42
+    for epoch in range(10):
+        loader_a = mx8.load(pinned_a, batch_size_samples=32, max_ram_gb=6)
+        loader_b = mx8.load(pinned_b, batch_size_samples=32, max_ram_gb=6)
+        
+        mixed = mx8.mix(
+            [loader_a, loader_b],
+            weights=[0.7, 0.3],
+            seed=seed,
+            epoch=epoch,  # Different mix each epoch
+            max_ram_gb=12,
+        )
+        
+        for batch in mixed:
+            train_step(batch)
+    ```
+  </Tab>
+
+  <Tab title="Distributed Mix">
+    ```python
+    import mx8
+
+    # Each source loader is distributed
+    loader_a = mx8.load(
+        "s3://bucket/a/",
+        batch_size_samples=128,
+        max_ram_gb=12,
+        job_id="train-mix",
+        cluster_url="http://coordinator:50051",
+    )
+    
+    loader_b = mx8.load(
+        "s3://bucket/b/",
+        batch_size_samples=128,
+        max_ram_gb=12,
+        job_id="train-mix",
+        cluster_url="http://coordinator:50051",
+    )
+
+    # Mix with distributed sources
+    mixed = mx8.mix(
+        [loader_a, loader_b],
+        weights=[0.7, 0.3],
+        seed=42,
+        epoch=0,
+        max_ram_gb=24,
+    )
+
+    for batch in mixed:
+        train_step(batch)
+    ```
+  </Tab>
+
+  <Tab title="Allow Source Exhaustion">
+    ```python
+    import mx8
+
+    # Small dataset A, large dataset B
+    loader_a = mx8.load("s3://bucket/small/", batch_size_samples=32, max_ram_gb=6)
+    loader_b = mx8.load("s3://bucket/large/", batch_size_samples=32, max_ram_gb=6)
+
+    mixed = mx8.mix(
+        [loader_a, loader_b],
+        weights=[0.5, 0.5],
+        seed=42,
+        epoch=0,
+        source_exhausted="allow",  # Continue when A exhausted
+        max_ram_gb=12,
+    )
+
+    for batch in mixed:
+        # Will drain B after A is exhausted
+        train_step(batch)
+    ```
+  </Tab>
+
+  <Tab title="Modality Mixing">
+    ```python
+    import mx8
+
+    # Mix text and image loaders
+    text_loader = mx8.text(
+        "s3://bucket/corpus/",
+        tokenizer="gpt2",
+        sequence_length=2048,
+        batch_size_samples=32,
+        max_ram_gb=6,
+    )
+    
+    image_loader = mx8.image(
+        "s3://bucket/images/",
+        resize_hw=(224, 224),
+        batch_size_samples=32,
+        max_ram_gb=6,
+    )
+
+    # Note: mixing different modalities requires custom batch handling
+    mixed = mx8.mix(
+        [text_loader, image_loader],
+        weights=[0.6, 0.4],
+        seed=42,
+        epoch=0,
+        max_ram_gb=12,
+    )
+
+    for batch in mixed:
+        # Dispatch to appropriate handler based on batch type
+        if hasattr(batch, 'token_ids'):
+            train_text(batch)
+        else:
+            train_vision(batch)
+    ```
+  </Tab>
+</Tabs>
+
+## Deterministic Ordering
+
+For a fixed set of:
+
+- Manifest hashes
+- Weights
+- Seed
+- Epoch
+- Frozen membership
+
+The mixed stream order is **deterministic and replayable**.
+
+```python
+# Same mix order every time with same inputs
+mixed = mx8.mix(
+    [loader_a, loader_b],
+    weights=[0.7, 0.3],
+    seed=42,
+    epoch=0,
+    max_ram_gb=12,
+)
+```
+
+Change `epoch` to get a different deterministic order:
+
+```python
+# Different order, still deterministic
+mixed = mx8.mix(
+    [loader_a, loader_b],
+    weights=[0.7, 0.3],
+    seed=42,
+    epoch=1,  # Different epoch → different order
+    max_ram_gb=12,
+)
+```
+
+## Stats & Monitoring
+
+```python
+stats = mixed.stats()
+
+# Per-source diagnostics
+for src in stats["mix_sources"]:
+    print(f"Source manifest: {src['manifest_id']}")
+    print(f"Delivered samples: {src['delivered_samples_total']}")
+    print(f"Delivered batches: {src['delivered_batches_total']}")
+    print(f"Weight: {src['weight']}")
+
+# Resume mismatch counter
+print(stats["mix_resume_source_checkpoint_mismatch_total"])
+
+# Standard pipeline metrics
+print(stats["delivered_samples_total"])
+print(stats["ram_high_water_bytes"])
+print(stats["inflight_bytes"])
+```
+
+## Checkpoint & Resume
+
+```python
+import mx8
+
+loader_a = mx8.load("s3://bucket/a/", batch_size_samples=32, max_ram_gb=6)
+loader_b = mx8.load("s3://bucket/b/", batch_size_samples=32, max_ram_gb=6)
+
+mixed = mx8.mix(
+    [loader_a, loader_b],
+    weights=[0.7, 0.3],
+    seed=42,
+    epoch=0,
+    max_ram_gb=12,
+)
+
+for step, batch in enumerate(mixed):
+    train_step(batch)
+    
+    if step % 1000 == 0:
+        token = mixed.checkpoint()
+        save_checkpoint(model, token)
+
+# Resume from checkpoint
+loader_a = mx8.load("s3://bucket/a/", batch_size_samples=32, max_ram_gb=6)
+loader_b = mx8.load("s3://bucket/b/", batch_size_samples=32, max_ram_gb=6)
+
+mixed = mx8.mix(
+    [loader_a, loader_b],
+    weights=[0.7, 0.3],
+    seed=42,
+    epoch=0,
+    resume_from=token,
+    max_ram_gb=12,
+)
+```
+
+## Shared Memory Envelope
+
+All source loaders share one inflight cap:
+
+```python
+# Each source gets 6GB, but mix enforces global 12GB cap
+loader_a = mx8.load("s3://bucket/a/", batch_size_samples=32, max_ram_gb=6)
+loader_b = mx8.load("s3://bucket/b/", batch_size_samples=32, max_ram_gb=6)
+
+mixed = mx8.mix(
+    [loader_a, loader_b],
+    weights=[0.7, 0.3],
+    seed=42,
+    epoch=0,
+    max_ram_gb=12,  # Global cap, not 6+6
+)
+```
+
+Backpressure is global across all sources.
+
+## Best Practices
+
+<Check>
+**Pin snapshots for multi-epoch reproducibility** — ensures same data across epochs
+</Check>
+
+<Check>
+**Use `source_exhausted="error"` (default) for balanced datasets** — catches unexpected exhaustion early
+</Check>
+
+<Check>
+**Set `source_exhausted="allow"` for imbalanced datasets** — drains larger datasets after smaller ones finish
+</Check>
+
+<Check>
+**Monitor `mix_sources` stats** — track per-source delivery and balance
+</Check>
+
+<Check>
+**Change `epoch` parameter across training epochs** — ensures different mix order each epoch
+</Check>
+
+<Warning>
+**All sources share one memory budget** — set `max_ram_gb` for the mix, not per-source totals
+</Warning>
+
+<Warning>
+**Resume requires matching `seed`, `epoch`, and source count** — strict validation enforced
+</Warning>
+
+## See Also
+
+- [Byte Loader](/loaders/bytes) - Raw byte streaming
+- [Text Loader](/loaders/text) - Tokenization pipeline
+- [Image Loader](/loaders/image) - Image decode and augmentation
+- Gate tests: `./scripts/mix_gate.sh`, `MX8_MIX_GATE_STRICT=1 ./scripts/mix_gate.sh`, `./scripts/mix_multirank_gate.sh`

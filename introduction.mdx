@@ -1,0 +1,177 @@
+---
+title: Introduction
+description: High-performance Rust data runtime for ML workloads
+---
+
+# MX8: The Data Runtime for Serious ML Workloads
+
+**Point to your data. Set a RAM limit. Train.**
+
+MX8 is a high-performance Rust data runtime exposed to Python, with a small coordinator/agent control plane for multi-node execution. It is built for large-scale inference, ETL, video preprocessing, and distributed training workloads.
+
+## The Problem
+
+Traditional data loaders suffer from:
+- Unbounded memory consumption leading to OOM kills
+- Independent per-node pulling causing synchronized bursts and oscillation
+- Manual manifest creation and dataset indexing overhead
+- Complex recovery logic when nodes fail during long-running jobs
+
+## The MX8 Solution
+
+```python
+import mx8
+
+loader = mx8.load(
+    "s3://your-bucket/dataset/",
+    batch_size_samples=512,
+    max_ram_gb=12,
+    profile="balanced",
+)
+
+for batch in loader:
+    train_step(batch)
+```
+
+That's it. MX8 handles the rest.
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="Bounded Memory" icon="memory">
+    Hard RSS caps with fail-fast guarantees. No more OOM kills. Set `max_ram_gb` and MX8 enforces it throughout the entire pipeline.
+  </Card>
+  
+  <Card title="Zero-Manifest Loading" icon="link">
+    Point to raw S3 prefixes. MX8 auto-indexes on first run and caches the manifest for deterministic replay.
+  </Card>
+  
+  <Card title="Deterministic Replay" icon="rotate">
+    Pin snapshots via `manifest_hash`. Same data, same order, every time. Critical for reproducible experiments.
+  </Card>
+  
+  <Card title="Recovery-Oriented" icon="shield-check">
+    Kill a node during inference or ETL? MX8's lease model reassigns unfinished work automatically. No manual intervention.
+  </Card>
+  
+  <Card title="Multi-Modal Support" icon="shapes">
+    Text, image, audio, video, and raw bytes under one unified API. Mix datasets with deterministic blending.
+  </Card>
+  
+  <Card title="Distributed by Default" icon="server">
+    Built-in coordinator for multi-node jobs. Cluster behaves like one coordinated consumer, not many independent loaders.
+  </Card>
+</CardGroup>
+
+## Design Philosophy
+
+MX8 follows three core principles:
+
+1. **Hot-path stays in-process**: Fetch, decode, pack, and deliver happen in Rust with bounded queues and backpressure. No network hops in the data path.
+
+2. **Tiny authority layer**: A small per-job coordinator handles ownership and pacing. Agents enforce local budgets. Control plane is minimal by design.
+
+3. **Fail-closed, not fail-open**: Invalid configurations are rejected at init time. Breach a cap? MX8 fails fast with an explicit error, not silently.
+
+## Performance Characteristics
+
+MX8 is built for:
+- **Offline inference**: Process billions of samples with bounded memory and automatic recovery
+- **ETL pipelines**: Preprocess massive datasets with stable throughput
+- **Large corpus processing**: Tokenize text corpora at scale without memory blowups
+- **Distributed training**: Multi-node training with epoch-boundary elasticity
+
+<Note>
+  Training in v1.8 supports epoch-boundary elasticity only. Mid-epoch rank loss requires restart, but you can add/remove nodes between epochs.
+</Note>
+
+## Runtime Guarantees
+
+- **Memory**: Hard process RSS cap. MX8 fails before OS OOM kill.
+- **Throughput**: Stable samples/sec. No synchronized bursts or oscillation.
+- **Determinism**: For pinned snapshot + frozen membership, sharding is deterministic.
+- **Recovery**: Unfinished lease portions are reassigned on node failure (inference/ETL).
+
+## Get Started
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get your first loader running in 2 minutes
+  </Card>
+  
+  <Card title="Installation" icon="download" href="/installation">
+    Installation instructions and system requirements
+  </Card>
+  
+  <Card title="Python API" icon="code" href="/api/python/overview">
+    Complete API reference for all loader types
+  </Card>
+  
+  <Card title="Architecture" icon="sitemap" href="/concepts/architecture">
+    Deep dive into MX8's distributed runtime design
+  </Card>
+</CardGroup>
+
+## What's Different?
+
+Unlike traditional data loaders:
+
+- **No silent failures**: Backpressure is explicit. Caps are enforced. Errors are actionable.
+- **No manual sharding**: Coordinator assigns work. You focus on training logic.
+- **No manifest hell**: Auto-index on first run. Pin snapshots for reproducibility.
+- **No synchronized bursts**: Cluster-wide pacing keeps throughput stable.
+
+## Real-World Use Cases
+
+```python
+# Large-scale inference
+loader = mx8.load(
+    "s3://production/inference-queue/",
+    batch_size_samples=512,
+    max_ram_gb=24,
+    profile="throughput",
+)
+
+for batch in loader:
+    predictions = model(batch.to_torch())
+    write_results(predictions)
+```
+
+```python
+# Video preprocessing pipeline
+loader = mx8.video(
+    "s3://raw-videos/",
+    clip_len=16,
+    stride=8,
+    fps=8,
+    batch_size_samples=32,
+    max_ram_gb=48,
+)
+
+for batch in loader:
+    process_clips(batch.payload)
+```
+
+```python
+# Multi-dataset training
+images = mx8.image("s3://imagenet/train/", max_ram_gb=12)
+text = mx8.text("s3://books/", tokenizer="gpt2", max_ram_gb=12)
+
+mixed = mx8.mix(
+    [images, text],
+    weights=[0.6, 0.4],
+    max_ram_gb=24,
+)
+
+for batch in mixed:
+    train_multimodal_step(batch)
+```
+
+## Next Steps
+
+Ready to get started?
+
+1. [Install MX8](/installation) via pip
+2. Follow the [Quickstart](/quickstart) to run your first example
+3. Explore the [Python API](/api/python/overview) for advanced features
+4. Read the [Architecture](/concepts/architecture) to understand the runtime model

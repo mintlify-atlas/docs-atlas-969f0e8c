@@ -1,0 +1,372 @@
+---
+title: Monitoring and Observability
+description: Metrics, alerting, and incident response for production MX8 deployments
+---
+
+This guide covers MX8 observability patterns, from in-process stats to production monitoring integrations and incident response.
+
+## Loader Stats API
+
+### Human-Readable Snapshot
+
+```python
+import mx8
+
+loader = mx8.load("s3://bucket/dataset/", max_ram_gb=12, profile="balanced")
+print(mx8.stats(loader))
+```
+
+Shows:
+- **Status**: loader state (running, exhausted, failed)
+- **Mode**: single-node or distributed
+- **Progress**: delivered samples and batches
+- **Throughput**: samples/sec, batches/sec
+- **Memory**: RSS, high-water mark, inflight bytes
+- **Stability**: jitter SLO breaches, autotune adjustments
+
+### Raw Counters
+
+```python
+raw = mx8.stats(loader, raw=True)
+
+print(raw["delivered_samples_total"])
+print(raw["delivered_batches_total"])
+print(raw["process_rss_bytes"])
+print(raw["max_process_rss_bytes"])
+print(raw["ram_high_water_bytes"])
+print(raw["inflight_bytes"])
+print(raw["elapsed_seconds"])
+```
+
+## Key Metrics
+
+### Memory Metrics
+
+- `process_rss_bytes`: Current process RSS
+- `max_process_rss_bytes`: Configured RSS cap (fail-fast threshold)
+- `ram_high_water_bytes`: Peak RSS during loader lifetime
+- `inflight_bytes`: Current pipeline inflight byte budget
+
+### Throughput Metrics
+
+- `delivered_samples_total`: Total samples delivered
+- `delivered_batches_total`: Total batches delivered
+- `elapsed_seconds`: Wall-clock time since loader start
+
+### Batch Jitter Metrics
+
+MX8 applies a tighter internal byte band around the target batch size to reduce oscillation:
+
+- `batch_payload_bytes_p50`: Median batch size
+- `batch_payload_bytes_p95`: 95th percentile batch size
+- `batch_payload_bytes_p95_over_p50`: Jitter ratio (p95/p50)
+- `batch_jitter_slo_breaches_total`: Count of SLO violations
+- `batch_jitter_band_adjustments_total`: Adaptive band tuning events
+- `batch_jitter_band_lower_pct`: Current lower band percentage
+- `batch_jitter_band_upper_pct`: Current upper band percentage
+
+<Note>
+MX8 emits a proof event when the jitter SLO is breached and adaptively tightens or relaxes the band with bounded hysteresis.
+</Note>
+
+## Prometheus Integration
+
+```python
+from prometheus_client import Gauge, start_http_server
+import mx8
+
+# Start Prometheus HTTP server
+start_http_server(9090)
+
+# Define gauges
+inflight = Gauge("mx8_inflight_bytes", "MX8 pipeline inflight bytes")
+rss = Gauge("mx8_process_rss_bytes", "MX8 process RSS bytes")
+hwm = Gauge("mx8_ram_high_water_bytes", "MX8 RAM high-water mark")
+delivered = Gauge("mx8_delivered_samples", "MX8 delivered samples total")
+jitter_breaches = Gauge("mx8_batch_jitter_slo_breaches", "MX8 batch jitter SLO breaches")
+
+loader = mx8.load("s3://bucket/dataset/", max_ram_gb=12, profile="balanced")
+
+for batch in loader:
+    train_step(batch)
+    
+    # Update metrics
+    s = loader.stats()
+    inflight.set(s["inflight_bytes"])
+    rss.set(s["process_rss_bytes"])
+    hwm.set(s["ram_high_water_bytes"])
+    delivered.set(s["delivered_samples_total"])
+    jitter_breaches.set(s.get("batch_jitter_slo_breaches_total", 0))
+```
+
+## Datadog Integration
+
+```python
+from datadog import initialize, statsd
+import mx8
+
+initialize()
+
+loader = mx8.load("s3://bucket/dataset/", max_ram_gb=12, profile="balanced")
+
+for step, batch in enumerate(loader):
+    train_step(batch)
+    
+    if step % 50 == 0:
+        s = loader.stats()
+        statsd.gauge("mx8.inflight_bytes", s["inflight_bytes"])
+        statsd.gauge("mx8.process_rss_bytes", s["process_rss_bytes"])
+        statsd.gauge("mx8.ram_high_water_bytes", s["ram_high_water_bytes"])
+        statsd.gauge("mx8.delivered_samples", s["delivered_samples_total"])
+        statsd.gauge("mx8.batch_jitter_breaches", s.get("batch_jitter_slo_breaches_total", 0))
+```
+
+## Alerting Rules
+
+### Memory Pressure
+
+<Warning>
+Alert when `ram_high_water_bytes` approaches your `MX8_MAX_PROCESS_RSS_BYTES` cap.
+</Warning>
+
+```yaml
+alert: MX8MemoryPressure
+expr: mx8_ram_high_water_bytes / mx8_max_process_rss_bytes > 0.9
+for: 5m
+annotations:
+  summary: MX8 loader approaching RSS cap
+  description: "RAM high-water mark is {{ $value | humanizePercentage }} of configured cap"
+```
+
+### Batch Jitter
+
+<Warning>
+Alert when `batch_jitter_slo_breaches_total` is rising steadily.
+</Warning>
+
+```yaml
+alert: MX8BatchJitter
+expr: rate(mx8_batch_jitter_slo_breaches[5m]) > 0.1
+for: 5m
+annotations:
+  summary: MX8 batch size jitter exceeding SLO
+  description: "Jitter SLO breach rate: {{ $value | humanize }} breaches/sec"
+```
+
+### Inflight Saturation
+
+<Warning>
+Alert when `inflight_bytes` is pegged at the cap for many consecutive steps.
+</Warning>
+
+```yaml
+alert: MX8InflightSaturated
+expr: mx8_inflight_bytes == mx8_max_inflight_bytes
+for: 10m
+annotations:
+  summary: MX8 pipeline inflight budget saturated
+  description: "Pipeline has been at inflight cap for 10+ minutes"
+```
+
+## Distributed Monitoring with TUI
+
+For distributed jobs, use the TUI to monitor coordinator state:
+
+```bash
+cargo run -p mx8-tui -- \
+  --coord-url http://coordinator-host:50051 \
+  --job-id prod-job-001
+```
+
+The TUI shows:
+- **Node registration**: all nodes in the job
+- **Heartbeat health**: `hb_age_ms` per node
+- **Active leases**: assigned ranges and progress cursors
+- **Job-level counters**: delivered samples, requeued ranges, expired leases
+
+For headless monitoring (CI, scripts):
+
+```bash
+cargo run -p mx8-tui -- \
+  --coord-url http://coordinator-host:50051 \
+  --job-id prod-job-001 \
+  --headless-polls 6 \
+  --poll-ms 300
+```
+
+## Production Incident Runbook
+
+### Stale Heartbeat
+
+**Symptom**: One or more nodes show stale heartbeat age in TUI. Progress slows while active leases remain open.
+
+<Steps>
+  <Step title="Check TUI">
+    ```bash
+    cargo run -p mx8-tui -- \
+      --coord-url "$MX8_COORD_URL" \
+      --job-id "$MX8_JOB_ID" \
+      --headless-polls 6 \
+      --poll-ms 300
+    ```
+
+    Look for nodes with `hb_age_ms` above stale threshold.
+  </Step>
+
+  <Step title="Verify node process and network">
+    Ensure node process is alive and has network reachability to coordinator.
+  </Step>
+
+  <Step title="Restart stale node's agent">
+    ```bash
+    MX8_COORD_URL='http://coordinator-host:50051' \
+    MX8_JOB_ID='prod-job-001' \
+    MX8_NODE_ID='node-0' \
+    target/release/mx8d-agent
+    ```
+  </Step>
+
+  <Step title="Wait for lease TTL and verify requeue">
+    You should see `ranges_requeued_total` increment and progress resume.
+  </Step>
+</Steps>
+
+<Warning>
+If stale heartbeats persist across two full lease TTL cycles, drain the job and restart coordinator and agents.
+</Warning>
+
+### Lease Stall
+
+**Symptom**: Leases are active but progress cursor is not advancing. Job appears running but no data is delivered.
+
+<Steps>
+  <Step title="Confirm delivery stall">
+    Verify workers are stuck at delivery, not just fetch/decode stage.
+  </Step>
+
+  <Step title="Force-restart stuck worker">
+    Restart the process on the affected node.
+  </Step>
+
+  <Step title="Let coordinator expire and reassign lease">
+    You should see `leases_expired_total` and `ranges_requeued_total` rise.
+  </Step>
+
+  <Step title="Verify job returns to progress">
+    If cursor remains unchanged after requeue, stop job and relaunch from pinned snapshot.
+  </Step>
+</Steps>
+
+### RSS Breach
+
+**Symptom**: Loader fails with `process rss ... exceeds max_process_rss_bytes`.
+
+<Note>
+This is expected behavior - MX8 is protecting the process from OS OOM kill.
+</Note>
+
+<Steps>
+  <Step title="Find cap source">
+    Check loader startup logs for `MX8_MAX_PROCESS_RSS_BYTES`, `max_ram_bytes`, or derived default.
+  </Step>
+
+  <Step title="Reduce pressure">
+    - Lower `max_inflight_bytes`
+    - Lower `prefetch_batches`
+    - Lower `max_queue_batches`
+    - Lower `want` on distributed loaders
+  </Step>
+
+  <Step title="Rerun with corrected values">
+    If you need to raise cap, do so in bounded increments and rerun readiness gates.
+  </Step>
+</Steps>
+
+### Resume Token Rejection
+
+**Symptom**: `RegisterNode` fails with errors like `invalid resume_from token`, `manifest_hash mismatch`, or `conflicting resume_from token`.
+
+<Steps>
+  <Step title="Verify coordinator counters in TUI">
+    Rising `resume_reject` confirms bad tokens. `resume_ok` should increase on success.
+  </Step>
+
+  <Step title="Enforce one token source">
+    Every rank must load the same checkpoint artifact and pass the same `resume_from` bytes.
+  </Step>
+
+  <Step title="Check timing">
+    If error says leases already issued, stop all ranks, restart coordinator, and relaunch with `resume_from` before any data requests.
+  </Step>
+
+  <Step title="Verify manifest/epoch match">
+    Ensure restart uses same pinned dataset (`@sha256:<hash>`) and epoch as checkpoint-producing run.
+  </Step>
+</Steps>
+
+<Warning>
+If rejections continue, relaunch without `resume_from` as a fresh epoch. Preserve failed token and coordinator log for review.
+</Warning>
+
+### Coordinator Failure
+
+**Symptom**: Active coordinator dies. Agents lose connection.
+
+<Note>
+In v1.8 with HA enabled, a follower should take over when shared lease/state paths are configured correctly.
+</Note>
+
+<Steps>
+  <Step title="Verify shared paths">
+    ```bash
+    echo $MX8_COORD_HA_LEASE_PATH
+    echo $MX8_COORD_STATE_STORE_PATH
+    ```
+
+    Ensure all candidates share these paths.
+  </Step>
+
+  <Step title="Restart coordinator">
+    ```bash
+    MX8_COORD_BIND_ADDR=0.0.0.0:50051 \
+    MX8_WORLD_SIZE=8 \
+    MX8_DATASET_LINK='s3://bucket/dataset/@refresh' \
+    target/release/mx8-coordinator
+    ```
+  </Step>
+
+  <Step title="Verify recovery in TUI">
+    ```bash
+    cargo run -p mx8-tui -- \
+      --coord-url "$MX8_COORD_URL" \
+      --job-id "$MX8_JOB_ID"
+    ```
+
+    You should see:
+    - Nodes re-register
+    - Heartbeats resume
+    - Progress counters start moving
+  </Step>
+</Steps>
+
+<Warning>
+If coordinator repeatedly fails or job cannot resume, drain and relaunch from pinned `@sha256:<hash>`.
+</Warning>
+
+## Production Readiness Checklist
+
+Run before any new deployment:
+
+```bash
+./scripts/prod_readiness.sh
+```
+
+Ensure:
+- `MX8_MAX_PROCESS_RSS_BYTES` is set as org-wide policy
+- `MX8_WORLD_SIZE` is explicitly configured
+- `MX8_DATASET_LINK` uses `@refresh` or pinned `@sha256:` hash
+- `MX8_MANIFEST_STORE_ROOT` backed by S3 or durable disk
+- `MX8_GRPC_MAX_MESSAGE_BYTES` matches on coordinator and all agents
+- Monitoring dashboards configured
+- Alert rules deployed
+- Runbook reviewed by on-call team

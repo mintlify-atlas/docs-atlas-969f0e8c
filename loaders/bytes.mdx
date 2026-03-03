@@ -1,0 +1,367 @@
+---
+title: "Byte Loader (mx8.load)"
+description: "Core byte-streaming API for raw data loading with bounded memory and distributed execution"
+---
+
+## Overview
+
+`mx8.load()` is the primary byte-loader API. It delivers batches of raw bytes with offsets and sample IDs, giving you full control over decoding and preprocessing.
+
+## Basic Usage
+
+```python
+import mx8
+
+loader = mx8.load(
+    "s3://bucket/prefix/",
+    batch_size_samples=64,
+    max_ram_gb=12,
+    profile="balanced",
+)
+
+for batch in loader:
+    sample_ids = batch.sample_ids  # [B] int64
+    payload    = batch.payload     # bytes
+    offsets    = batch.offsets     # [B+1] int64
+```
+
+Each sample's byte slice is `payload[offsets[i]:offsets[i+1]]`.
+
+## Parameters
+
+### Dataset Selection
+
+<ParamField path="dataset_link" type="str" required>
+  Path or S3 prefix to load from. Supports snapshot modifiers:
+  - Plain path: `"s3://bucket/data/"`
+  - Fresh snapshot: `"s3://bucket/data@refresh"`
+  - Pinned snapshot: `"s3://bucket/data@sha256:<hash>"`
+</ParamField>
+
+<ParamField path="manifest_store" type="str" default="~/.mx8/manifests">
+  Manifest store root for local caching
+</ParamField>
+
+<ParamField path="manifest_path" type="str">
+  Override with a specific local manifest TSV (for development/testing)
+</ParamField>
+
+<ParamField path="recursive" type="bool" default={true}>
+  Index subdirectories recursively
+</ParamField>
+
+### Batch Configuration
+
+<ParamField path="batch_size_samples" type="int" required>
+  Number of samples per batch
+</ParamField>
+
+<ParamField path="target_batch_bytes" type="int">
+  Target batch size in bytes (auto-derived from memory budget by default)
+</ParamField>
+
+<ParamField path="max_batch_bytes" type="int">
+  Hard limit on batch size in bytes
+</ParamField>
+
+### Memory Management
+
+<ParamField path="max_ram_gb" type="int | float" required>
+  Recommended memory budget. MX8 derives `max_inflight_bytes` and RSS caps from this value.
+</ParamField>
+
+<ParamField path="profile" type="str" default="balanced">
+  Safety/throughput preset:
+  - `"safe"`: conservative limits, lowest memory risk
+  - `"balanced"`: recommended default
+  - `"throughput"`: aggressive prefetching, higher memory usage
+</ParamField>
+
+<ParamField path="constraints" type="mx8.Constraints">
+  Override specific cap values while keeping autotune active
+</ParamField>
+
+<ParamField path="runtime" type="mx8.RuntimeConfig">
+  Explicit startup values when `autotune=False`
+</ParamField>
+
+<ParamField path="autotune" type="bool" default={true}>
+  Enable runtime adaptation loop
+</ParamField>
+
+### Sample Range
+
+<ParamField path="start_id" type="int">
+  Starting sample ID (must be set together with `end_id`)
+</ParamField>
+
+<ParamField path="end_id" type="int">
+  Ending sample ID (exclusive)
+</ParamField>
+
+### Distributed Execution
+
+<ParamField path="job_id" type="str">
+  Job identifier (required for distributed mode)
+</ParamField>
+
+<ParamField path="cluster_url" type="str">
+  Coordinator URL for distributed attach. Falls back to `MX8_CLUSTER_URL` or `MX8_COORD_URL` env vars.
+</ParamField>
+
+<ParamField path="node_id" type="str">
+  Node identity for proof logs and coordinator ownership. Defaults to `rank{RANK}` in distributed mode.
+</ParamField>
+
+### Checkpoint & Resume
+
+<ParamField path="resume_from" type="str">
+  Opaque checkpoint token from `loader.checkpoint()`. Validation is strict: `manifest_hash`, `schema_version`, `epoch`, and `end_id` must match.
+</ParamField>
+
+### Auto-packing
+
+<ParamField path="autopack" type="bool" default={false}>
+  If `True` and dataset has no manifest, MX8 runs a full pack in-place before loading
+</ParamField>
+
+<ParamField path="autopack_shard_mb" type="int" default={512}>
+  Shard size in MB when auto-packing
+</ParamField>
+
+## Usage Patterns
+
+<Tabs>
+  <Tab title="Single Node">
+    ```python
+    import mx8
+
+    loader = mx8.load(
+        "s3://bucket/prefix/",
+        batch_size_samples=64,
+        max_ram_gb=12,
+        profile="balanced",
+    )
+
+    for batch in loader:
+        sample_ids = batch.sample_ids
+        payload = batch.payload
+        offsets = batch.offsets
+
+        # Process each sample
+        for i in range(len(sample_ids)):
+            sample_bytes = payload[offsets[i]:offsets[i+1]]
+            process(sample_bytes)
+    ```
+  </Tab>
+
+  <Tab title="Distributed (Explicit)">
+    ```python
+    import mx8
+
+    loader = mx8.load(
+        "s3://bucket/prefix/",
+        batch_size_samples=512,
+        max_ram_gb=24,
+        job_id="train-job-001",
+        cluster_url="http://coordinator-host:50051",
+    )
+
+    for batch in loader:
+        train_step(batch)
+    ```
+  </Tab>
+
+  <Tab title="Distributed (Env Attach)">
+    ```python
+    # WORLD_SIZE>1, MX8_JOB_ID, MX8_CLUSTER_URL set by launcher
+    import mx8
+
+    loader = mx8.load(
+        "s3://bucket/prefix/",
+        batch_size_samples=512,
+        max_ram_gb=24,
+    )
+
+    for batch in loader:
+        train_step(batch)
+    ```
+  </Tab>
+
+  <Tab title="PyTorch Integration">
+    ```python
+    import mx8
+
+    loader = mx8.load(
+        "s3://bucket/prefix/",
+        batch_size_samples=64,
+        max_ram_gb=12,
+    )
+
+    for batch in loader:
+        # Convert to PyTorch tensors
+        payload_u8, offsets_i64, sample_ids_i64 = batch.to_torch()
+        
+        # With labels (if available)
+        payload_u8, offsets_i64, sample_ids_i64, labels_i64 = batch.to_torch_with_labels()
+    ```
+  </Tab>
+
+  <Tab title="Pinned Snapshot">
+    ```python
+    import mx8
+
+    # Resolve manifest hash once
+    manifest_hash = mx8.resolve_manifest_hash("s3://bucket/data@refresh")
+    pinned = f"s3://bucket/data@sha256:{manifest_hash}"
+
+    # Use same snapshot across epochs
+    for epoch in range(10):
+        loader = mx8.load(pinned, batch_size_samples=64, max_ram_gb=8)
+        for batch in loader:
+            train_step(batch)
+    ```
+  </Tab>
+
+  <Tab title="Checkpoint & Resume">
+    ```python
+    import mx8
+
+    loader = mx8.load(
+        "s3://bucket/prefix/",
+        batch_size_samples=64,
+        max_ram_gb=12,
+    )
+
+    for step, batch in enumerate(loader):
+        train_step(batch)
+        
+        if step % 1000 == 0:
+            # Save checkpoint
+            token = loader.checkpoint()
+            save_checkpoint(model, token)
+
+    # Resume from checkpoint
+    loader = mx8.load(
+        "s3://bucket/prefix/",
+        batch_size_samples=64,
+        max_ram_gb=12,
+        resume_from=token,
+    )
+    ```
+  </Tab>
+</Tabs>
+
+## Batch Format
+
+Each batch exposes:
+
+- `sample_ids`: int64 array of sample identifiers
+- `offsets`: int64 array of byte offsets (length = `len(sample_ids) + 1`)
+- `payload`: raw bytes for all samples concatenated
+- `label_ids`: int64 array of labels (if available)
+
+Extract individual samples:
+
+```python
+for i in range(len(batch.sample_ids)):
+    sample_bytes = batch.payload[batch.offsets[i]:batch.offsets[i+1]]
+    # Decode/process sample_bytes
+```
+
+## Stats & Monitoring
+
+```python
+import mx8
+
+loader = mx8.load("s3://bucket/dataset/", max_ram_gb=12, profile="balanced")
+
+# Human-readable snapshot
+print(mx8.stats(loader))
+
+# Raw metrics dict
+raw = mx8.stats(loader, raw=True)
+raw = loader.stats()  # equivalent
+```
+
+Key metrics:
+
+- `delivered_batches_total`: total batches delivered
+- `delivered_samples_total`: total samples delivered
+- `process_rss_bytes`: current process RSS
+- `max_process_rss_bytes`: RSS high-water mark
+- `ram_high_water_bytes`: MX8 pipeline memory peak
+- `inflight_bytes`: current in-flight data
+- `elapsed_seconds`: loader runtime
+
+### Prometheus Integration
+
+```python
+from prometheus_client import Gauge, start_http_server
+import mx8
+
+start_http_server(9090)
+
+inflight  = Gauge("mx8_inflight_bytes",       "MX8 pipeline inflight bytes")
+rss       = Gauge("mx8_process_rss_bytes",    "MX8 process RSS bytes")
+hwm       = Gauge("mx8_ram_high_water_bytes", "MX8 RAM high-water mark")
+delivered = Gauge("mx8_delivered_samples",    "MX8 delivered samples total")
+
+loader = mx8.load("s3://bucket/dataset/", max_ram_gb=12, profile="balanced")
+
+for batch in loader:
+    train_step(batch)
+    s = loader.stats()
+    inflight.set(s["inflight_bytes"])
+    rss.set(s["process_rss_bytes"])
+    hwm.set(s["ram_high_water_bytes"])
+    delivered.set(s["delivered_samples_total"])
+```
+
+### Datadog Integration
+
+```python
+from datadog import initialize, statsd
+import mx8
+
+initialize()
+
+loader = mx8.load("s3://bucket/dataset/", max_ram_gb=12, profile="balanced")
+
+for step, batch in enumerate(loader):
+    train_step(batch)
+    if step % 50 == 0:
+        s = loader.stats()
+        statsd.gauge("mx8.inflight_bytes",       s["inflight_bytes"])
+        statsd.gauge("mx8.process_rss_bytes",    s["process_rss_bytes"])
+        statsd.gauge("mx8.ram_high_water_bytes", s["ram_high_water_bytes"])
+        statsd.gauge("mx8.delivered_samples",    s["delivered_samples_total"])
+```
+
+## Best Practices
+
+<Check>
+**Use `max_ram_gb` for memory budgets** — simpler and safer than manual `max_inflight_bytes`
+</Check>
+
+<Check>
+**Pin snapshots for multi-epoch training** — ensures consistent data across epochs
+</Check>
+
+<Check>
+**Monitor `ram_high_water_bytes`** — alert when approaching your memory cap
+</Check>
+
+<Check>
+**Call `loader.close()` explicitly** — releases resources promptly in long-running processes
+</Check>
+
+<Warning>
+**Loaders are single-pass** — create a new loader for each epoch
+</Warning>
+
+## See Also
+
+- [Text Loader](/loaders/text) - Tokenization pipeline
+- [Image Loader](/loaders/image) - Image decode and augmentation
+- [Mix API](/loaders/mix) - Multi-dataset blending

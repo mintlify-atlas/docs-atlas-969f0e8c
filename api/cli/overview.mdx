@@ -1,0 +1,119 @@
+---
+title: CLI Tools Overview
+description: Command-line tools for managing MX8 data pipelines
+---
+
+MX8 provides three core CLI tools for deploying and monitoring distributed data pipelines:
+
+- **mx8-coordinator**: Control plane server that manages leases, dataset ownership, and job coordination
+- **mx8d-agent**: Worker process that runs on each node to execute data pipeline tasks
+- **mx8-tui**: Terminal UI for monitoring live job state and diagnosing issues
+
+## Architecture
+
+A typical MX8 deployment consists of:
+
+1. **One coordinator process** acting as the job control plane
+2. **One agent process per node** handling local memory caps and feeding work to runtimes
+3. **Optional TUI** for real-time monitoring and diagnostics
+
+The coordinator manages leases and dataset ownership but never proxies dataset data bytes. Agents and runtimes fetch data directly from storage (S3 or filesystem).
+
+## Quick Start
+
+### Build the binaries
+
+```bash
+cargo build -p mx8-coordinator --features s3
+cargo build -p mx8d-agent --features s3
+cargo build -p mx8-tui
+```
+
+Omit `--features s3` if using filesystem-only datasets.
+
+### Start the coordinator
+
+```bash
+MX8_COORD_BIND_ADDR=0.0.0.0:50051 \
+MX8_WORLD_SIZE=8 \
+MX8_DATASET_LINK='s3://your-bucket/dataset/@refresh' \
+MX8_MANIFEST_STORE_ROOT='s3://your-bucket/manifests/' \
+target/release/mx8-coordinator
+```
+
+### Start agents on each node
+
+```bash
+MX8_COORD_URL='http://coordinator-host:50051' \
+MX8_JOB_ID='prod-job-001' \
+MX8_NODE_ID='node-0' \
+MX8_BATCH_SIZE_SAMPLES=512 \
+MX8_MAX_INFLIGHT_BYTES=134217728 \
+MX8_MAX_PROCESS_RSS_BYTES=68719476736 \
+target/release/mx8d-agent
+```
+
+### Monitor with TUI
+
+```bash
+cargo run -p mx8-tui -- \
+  --coord-url http://coordinator-host:50051 \
+  --job-id prod-job-001
+```
+
+## Configuration Pattern
+
+All CLI tools follow a consistent configuration pattern:
+
+- Every CLI argument has a corresponding environment variable
+- Environment variables use the `MX8_` prefix
+- CLI flags override environment variables
+- Timing values are in milliseconds
+- Default values are production-safe for small deployments
+
+## Network Topology
+
+The coordinator binds a gRPC port (default `0.0.0.0:50051`) that every agent connects to. Each agent:
+
+- Runs on one node
+- Talks to the coordinator for leases, heartbeats, and progress reporting
+- Fetches data directly from the manifest store (S3 or filesystem)
+
+Place the coordinator on a node with stable network paths to all agents and the manifest store. The default heartbeat interval is 1 second, so network reliability matters more than raw latency.
+
+## Failure Handling
+
+When an agent dies or stops heartbeating:
+
+1. Coordinator waits for lease TTL to expire (default 10 seconds)
+2. Unfinished range `[cursor, end)` is automatically requeued
+3. Remaining agents pick up the work and continue draining
+4. No manual intervention needed unless the agent doesn't return
+
+When the coordinator dies with HA enabled:
+
+1. Leader transition continues control-plane progress
+2. Agents reconnect automatically
+3. Heartbeats and lease issuance resume
+
+## Production Baseline
+
+Before running production jobs, set these explicitly:
+
+- `MX8_MAX_PROCESS_RSS_BYTES`: Set as org-wide policy, not per-job ad-hoc values
+- `MX8_WORLD_SIZE`: Use explicit value rather than relying on defaults
+- `MX8_DATASET_LINK`: Use `@refresh` or pinned `@sha256:` hash for production
+- `MX8_MANIFEST_STORE_ROOT`: Back by S3 or durable disk, not local ephemeral storage
+- `MX8_GRPC_MAX_MESSAGE_BYTES`: Set to same value on coordinator and all agents
+
+Run the readiness suite before new deployments:
+
+```bash
+./scripts/prod_readiness.sh
+```
+
+## Next Steps
+
+- [Coordinator Reference](/api/cli/coordinator) - Full coordinator configuration
+- [Agent Reference](/api/cli/agent) - Agent deployment and tuning
+- [TUI Reference](/api/cli/tui) - Monitoring and diagnostics

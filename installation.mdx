@@ -1,0 +1,521 @@
+---
+title: Installation
+description: Install MX8 and configure your environment
+---
+
+# Installation
+
+MX8 is distributed as a Python package with precompiled Rust binaries for major platforms.
+
+## Quick Install
+
+Install via pip:
+
+```bash
+pip install mx8
+```
+
+Verify installation:
+
+```bash
+python -c "import mx8; print(mx8.__version__)"
+```
+
+## System Requirements
+
+### Supported Platforms
+
+- **Linux**: x86_64, glibc 2.17+ (manylinux2014)
+- **macOS**: 10.15+ (both x86_64 and arm64)
+- **Windows**: Not officially supported in v1.8
+
+### Python Versions
+
+- Python 3.8, 3.9, 3.10, 3.11, 3.12
+
+### Hardware Requirements
+
+**Minimum**:
+- 4GB RAM
+- 2 CPU cores
+- Network access to data sources (S3, local filesystem)
+
+**Recommended**:
+- 16GB+ RAM for production workloads
+- 8+ CPU cores for parallel decode
+- NVMe storage for local manifest cache
+- 10Gbps+ network for S3-heavy workloads
+
+## Optional Dependencies
+
+MX8 core has minimal dependencies, but additional packages enable specific features:
+
+### For Vision Workloads
+
+```bash
+pip install mx8 pillow numpy torch
+```
+
+- `pillow` - Image decode backend (default in v1.8)
+- `numpy` - Tensor operations
+- `torch` - PyTorch integration for training
+
+### For Text Workloads
+
+```bash
+pip install mx8 torch
+```
+
+- `torch` - Required for tokenized output tensors
+
+### For Development
+
+```bash
+pip install mx8 pytest black mypy
+```
+
+- `pytest` - Testing framework
+- `black` - Code formatting
+- `mypy` - Type checking
+
+## Full Installation
+
+For all features:
+
+```bash
+pip install mx8 pillow numpy torch pytest
+```
+
+## Installation from Source
+
+<Note>
+  Only required if you're contributing to MX8 or need unreleased features.
+</Note>
+
+### Prerequisites
+
+- Rust 1.70+ (install via [rustup](https://rustup.rs))
+- Python 3.8+
+- [maturin](https://github.com/PyO3/maturin) - Rust/Python build tool
+
+### Build Steps
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/your-org/mx8.git
+    cd mx8
+    ```
+  </Step>
+
+  <Step title="Install Rust toolchain">
+    ```bash
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+    source $HOME/.cargo/env
+    ```
+  </Step>
+
+  <Step title="Install maturin">
+    ```bash
+    pip install maturin
+    ```
+  </Step>
+
+  <Step title="Build and install">
+    ```bash
+    maturin develop --release
+    ```
+  </Step>
+
+  <Step title="Verify build">
+    ```bash
+    python -c "import mx8; print(mx8.__version__)"
+    ```
+  </Step>
+</Steps>
+
+## Environment Configuration
+
+MX8 uses environment variables for global configuration. All variables are optional and have sensible defaults.
+
+### Core Settings
+
+#### `MX8_MANIFEST_STORE`
+
+Manifest store root path (default: `~/.mx8/manifests`).
+
+```bash
+export MX8_MANIFEST_STORE=/mnt/shared/mx8-manifests
+```
+
+Supports both filesystem paths and S3 URLs:
+
+```bash
+export MX8_MANIFEST_STORE=s3://my-bucket/mx8-manifests/
+```
+
+#### `MX8_MAX_PROCESS_RSS_BYTES`
+
+Process RSS cap in bytes. MX8 fails fast before OS OOM kill.
+
+```bash
+export MX8_MAX_PROCESS_RSS_BYTES=$((24 * 1024 * 1024 * 1024))  # 24GB
+```
+
+<Warning>
+  Setting this lower than `max_ram_gb` in your loader will cause failures. Use `max_ram_gb` in code instead.
+</Warning>
+
+### Distributed Settings
+
+#### `MX8_CLUSTER_URL` / `MX8_COORD_URL`
+
+Coordinator URL for distributed attach:
+
+```bash
+export MX8_CLUSTER_URL=http://coordinator.cluster.local:50051
+```
+
+#### `MX8_JOB_ID`
+
+Job identifier for distributed mode:
+
+```bash
+export MX8_JOB_ID=train-job-001
+```
+
+#### `MX8_MIN_WORLD_SIZE`
+
+Minimum nodes before job starts (default: `world_size`):
+
+```bash
+export MX8_MIN_WORLD_SIZE=6  # start with 6/8 nodes
+```
+
+### Image Decode Settings
+
+#### `MX8_DECODE_BACKEND`
+
+Image decode backend (`pillow` or `rust`, default: `pillow`):
+
+```bash
+export MX8_DECODE_BACKEND=rust  # experimental Rust decoder
+```
+
+#### `MX8_DECODE_THREADS`
+
+Decode worker threads (Rust backend only, default: CPU count):
+
+```bash
+export MX8_DECODE_THREADS=8
+```
+
+#### `MX8_RUST_JPEG_CODEC`
+
+JPEG codec for Rust backend (`zune`, `image`, or `turbo`):
+
+```bash
+export MX8_RUST_JPEG_CODEC=turbo
+```
+
+### Video Decode Settings
+
+#### `MX8_VIDEO_DECODE_BACKEND`
+
+Video decode backend (`cli` or `ffi`, default: `cli`):
+
+```bash
+export MX8_VIDEO_DECODE_BACKEND=ffi  # native FFI path
+```
+
+<Note>
+  FFI backend requires building with `RUSTFLAGS="--cfg mx8_video_ffi"`
+</Note>
+
+#### `MX8_FFMPEG_BIN`
+
+Path to ffmpeg binary (CLI backend only):
+
+```bash
+export MX8_FFMPEG_BIN=/usr/local/bin/ffmpeg
+```
+
+### Packing Settings
+
+#### `MX8_PACK_PARALLEL_FETCHES`
+
+Concurrent S3 fetches during packing (default: 128):
+
+```bash
+export MX8_PACK_PARALLEL_FETCHES=256
+```
+
+#### `MX8_PACK_PART_MB`
+
+Multipart upload part size in MB (default: 16):
+
+```bash
+export MX8_PACK_PART_MB=32
+```
+
+### Coordinator Settings
+
+#### `MX8_COORD_BIND_ADDR`
+
+Coordinator bind address:
+
+```bash
+export MX8_COORD_BIND_ADDR=0.0.0.0:50051
+```
+
+#### `MX8_COORD_HA_ENABLE`
+
+Enable coordinator HA (default: `1`):
+
+```bash
+export MX8_COORD_HA_ENABLE=0  # disable HA
+```
+
+#### `MX8_LEASE_LOG_PATH`
+
+Durable lease log path (default: `~/.mx8/lease_logs/<manifest_hash>.log`):
+
+```bash
+export MX8_LEASE_LOG_PATH=/mnt/shared/lease_logs
+```
+
+Set to `none` to disable:
+
+```bash
+export MX8_LEASE_LOG_PATH=none
+```
+
+## AWS Configuration
+
+MX8 uses the standard AWS SDK credential chain:
+
+1. Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
+2. AWS credentials file (`~/.aws/credentials`)
+3. IAM instance profile (EC2, ECS, EKS)
+4. IAM role (Lambda, Fargate)
+
+### Example: IAM Policy for S3 Access
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:ListBucket",
+        "s3:PutObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::your-bucket/*",
+        "arn:aws:s3:::your-bucket"
+      ]
+    }
+  ]
+}
+```
+
+<Note>
+  `PutObject` is only required if using `autopack` or `mx8.pack()`.
+</Note>
+
+### Environment Variables
+
+```bash
+export AWS_ACCESS_KEY_ID=your_access_key
+export AWS_SECRET_ACCESS_KEY=your_secret_key
+export AWS_DEFAULT_REGION=us-east-1
+```
+
+### Named Profiles
+
+```bash
+export AWS_PROFILE=production
+```
+
+## Docker Installation
+
+MX8 can be installed in Docker containers:
+
+```dockerfile
+FROM python:3.11-slim
+
+# Install system dependencies (if needed for Pillow/video)
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    libimage-exiftool-perl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install MX8 and dependencies
+RUN pip install --no-cache-dir mx8 pillow numpy torch
+
+# Copy your training script
+COPY train.py /app/train.py
+
+WORKDIR /app
+CMD ["python", "train.py"]
+```
+
+Build and run:
+
+```bash
+docker build -t mx8-trainer .
+docker run --rm \
+  -e AWS_ACCESS_KEY_ID=your_key \
+  -e AWS_SECRET_ACCESS_KEY=your_secret \
+  mx8-trainer
+```
+
+## Kubernetes Deployment
+
+Example manifest for distributed training:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mx8-coordinator
+spec:
+  containers:
+  - name: coordinator
+    image: your-org/mx8-coordinator:latest
+    env:
+    - name: MX8_COORD_BIND_ADDR
+      value: "0.0.0.0:50051"
+    - name: MX8_COORD_HA_ENABLE
+      value: "1"
+    ports:
+    - containerPort: 50051
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mx8-workers
+spec:
+  replicas: 8
+  selector:
+    matchLabels:
+      app: mx8-worker
+  template:
+    metadata:
+      labels:
+        app: mx8-worker
+    spec:
+      containers:
+      - name: worker
+        image: your-org/mx8-trainer:latest
+        env:
+        - name: MX8_CLUSTER_URL
+          value: "http://mx8-coordinator:50051"
+        - name: MX8_JOB_ID
+          value: "train-001"
+        - name: RANK
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        - name: WORLD_SIZE
+          value: "8"
+        resources:
+          limits:
+            memory: "32Gi"
+            cpu: "8"
+```
+
+## Verification
+
+After installation, verify all components:
+
+```bash
+# Core functionality
+python -c "import mx8; print('MX8 version:', mx8.__version__)"
+
+# Image support
+python -c "import mx8; from PIL import Image; print('Image support: OK')"
+
+# PyTorch integration
+python -c "import mx8; import torch; print('PyTorch support: OK')"
+
+# S3 access (requires AWS credentials)
+python -c "import mx8; mx8.resolve_manifest_hash('s3://your-bucket/test/')"
+```
+
+## Troubleshooting
+
+### ImportError: No module named 'mx8'
+
+Ensure you're using the correct Python environment:
+
+```bash
+which python
+pip list | grep mx8
+```
+
+### Error: "ffmpeg not found" (video decode)
+
+Install ffmpeg:
+
+```bash
+# Ubuntu/Debian
+sudo apt-get install ffmpeg
+
+# macOS
+brew install ffmpeg
+
+# Or set custom path
+export MX8_FFMPEG_BIN=/path/to/ffmpeg
+```
+
+### Error: "Pillow decode failed" (image decode)
+
+Install Pillow:
+
+```bash
+pip install pillow
+```
+
+Or use the Rust decoder:
+
+```bash
+export MX8_DECODE_BACKEND=rust
+```
+
+### Permission denied accessing `~/.mx8/manifests`
+
+Change the manifest store path:
+
+```bash
+export MX8_MANIFEST_STORE=/tmp/mx8-manifests
+```
+
+Or fix permissions:
+
+```bash
+mkdir -p ~/.mx8/manifests
+chmod 755 ~/.mx8/manifests
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Run your first loader in 2 minutes
+  </Card>
+  
+  <Card title="Python API" icon="code" href="/api/python/overview">
+    Explore all loader types and configuration options
+  </Card>
+  
+  <Card title="Deployment Guide" icon="server" href="/guides/deployment">
+    Production deployment patterns
+  </Card>
+  
+  <Card title="Configuration Reference" icon="gears" href="/api/env/overview">
+    Complete environment variable reference
+  </Card>
+</CardGroup>

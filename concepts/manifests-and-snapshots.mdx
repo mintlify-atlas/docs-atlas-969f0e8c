@@ -1,0 +1,369 @@
+---
+title: Manifests and Snapshots
+description: Dataset manifests, pinned snapshots, and the manifest store
+---
+
+MX8 always runs off a **pinned snapshot** (`manifest_hash`), even if the user only provides a prefix/path. This ensures deterministic, reproducible runs and enables exact replay of any job.
+
+## The Snapshot Rule
+
+Every MX8 job resolves to a pinned snapshot before execution:
+
+- **Plain link** (`s3://bucket/prefix/`) → resolves to the current pinned snapshot
+- **Pinned link** (`...@sha256:<manifest_hash>`) → uses that exact snapshot; no listing/indexing
+- **Refresh link** (`...@refresh`) → forces a new snapshot at job start; updates the intent pointer
+
+<Info>
+v1.8 refresh is **job-start only** (frozen within a run). No mid-run pickup of newly added data.
+</Info>
+
+## Manifest Format
+
+v1.8 manifest format: **canonical TSV** (`_mx8/manifest.tsv` for packed datasets).
+
+### Structure
+
+Each row represents one sample:
+
+```
+sample_id<TAB>location[<TAB>byte_offset<TAB>byte_length[<TAB>decode_hint]]
+```
+
+- `sample_id`: u64 in `[0..N)`
+- `location`: path/key to the data object
+- `byte_offset`, `byte_length`: optional for multi-sample archives
+- `decode_hint`: optional metadata (e.g., `mx8:vision:imagefolder;label_id=5`)
+
+### Example
+
+```tsv
+0	s3://bucket/images/cat_001.jpg
+1	s3://bucket/images/dog_002.jpg
+2	s3://bucket/images/cat_003.jpg
+3	s3://bucket/images/bird_004.jpg
+```
+
+With decode hints for ImageFolder:
+
+```tsv
+0	s3://bucket/images/cat/001.jpg			mx8:vision:imagefolder;label_id=0
+1	s3://bucket/images/dog/002.jpg			mx8:vision:imagefolder;label_id=1
+2	s3://bucket/images/cat/003.jpg			mx8:vision:imagefolder;label_id=0
+3	s3://bucket/images/bird/004.jpg			mx8:vision:imagefolder;label_id=2
+```
+
+## Manifest Hash
+
+The `manifest_hash` is computed via a **canonical hashing rule** over records + schema version (not raw file bytes).
+
+```python
+import mx8
+
+loader = mx8.load("s3://bucket/dataset/")
+print(f"Manifest hash: {loader.manifest_hash}")
+# Output: sha256:a3f2b8c9d1e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0
+```
+
+<Warning>
+The hash is stable for a given dataset state. If you add/remove/modify files and refresh, you get a new `manifest_hash`.
+</Warning>
+
+## Manifest Store
+
+The `manifest_store` is a configured location for manifests, locks, and intent pointers.
+
+### Supported Backends
+
+<Tabs>
+  <Tab title="Filesystem">
+    Default: `~/.mx8/manifests`
+
+    ```python
+    loader = mx8.load(
+        "s3://bucket/dataset/",
+        manifest_store="/shared/manifests",  # Filesystem path
+    )
+    ```
+
+    ```bash
+    export MX8_MANIFEST_STORE_ROOT=/shared/manifests
+    ```
+  </Tab>
+  <Tab title="S3">
+    Use S3 prefix for shared state across nodes:
+
+    ```python
+    loader = mx8.load(
+        "s3://bucket/dataset/",
+        manifest_store="s3://bucket/manifests/",  # S3 prefix
+    )
+    ```
+
+    ```bash
+    export MX8_MANIFEST_STORE_ROOT=s3://bucket/manifests/
+    ```
+  </Tab>
+</Tabs>
+
+### Directory Structure
+
+```
+manifest_store/
+├── intents/
+│   └── s3_bucket_dataset.intent       # Points to current snapshot
+├── snapshots/
+│   ├── sha256_a3f2b8c9.../
+│   │   └── manifest.tsv               # Pinned snapshot
+│   └── sha256_d4e5f6a7.../
+│       └── manifest.tsv
+├── locks/
+│   └── s3_bucket_dataset.lock         # Prevents concurrent indexing
+└── lease_logs/
+    └── sha256_a3f2b8c9....log          # Durable lease progress
+```
+
+## Portability Rule (Multi-Node)
+
+<Warning>
+Do **not** assume filesystem paths are shared/mounted identically across nodes.
+</Warning>
+
+MX8 handles portability automatically:
+
+- **Agents** should not need direct access to `manifest_store`
+- **Coordinator** provides a manifest proxy fallback: if an agent cannot fetch `manifest_url` directly, it requests manifest bytes by `manifest_hash` from the coordinator and caches locally
+- **Coordinator** never proxies dataset *data* bytes (only manifests/control-plane)
+
+## Dataset Links
+
+### Plain Link
+
+Resolves to the current pinned snapshot for the intent:
+
+```python
+import mx8
+
+# First run: creates snapshot
+loader = mx8.load("s3://bucket/dataset/")
+print(loader.manifest_hash)  # sha256:a3f2...
+
+# Second run: uses same snapshot (frozen)
+loader2 = mx8.load("s3://bucket/dataset/")
+print(loader2.manifest_hash)  # sha256:a3f2... (same)
+```
+
+### Pinned Link
+
+Uses exact snapshot; no listing/indexing:
+
+```python
+import mx8
+
+loader = mx8.load(
+    "s3://bucket/dataset/@sha256:a3f2b8c9d1e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0"
+)
+```
+
+<Info>
+Use pinned links in production for exact reproducibility.
+</Info>
+
+### Refresh Link
+
+Forces a new snapshot at job start:
+
+```python
+import mx8
+
+# Forces re-indexing and updates intent pointer
+loader = mx8.load("s3://bucket/dataset/@refresh")
+print(loader.manifest_hash)  # sha256:d4e5... (new)
+```
+
+## Packing Convention (Optional)
+
+If a prefix contains a precomputed canonical manifest at `s3://bucket/prefix/_mx8/manifest.tsv`, the snapshot resolver uses it instead of listing objects.
+
+### Benefits of Packing
+
+- **Near-zero startup time**: no LIST operations
+- **Full deterministic shuffle**: block-based shuffle with stable seed
+- **Stable label IDs**: baked into manifest permanently
+- **Cryptographic hash**: pin and reproduce any run exactly
+
+### Packing a Dataset
+
+```python
+import mx8
+
+# Pack a directory
+mx8.pack_dir(
+    input_dir="/data/imagenet/",
+    output_prefix="s3://bucket/imagenet-packed/",
+)
+
+# Pack an S3 prefix
+mx8.pack_s3(
+    input_prefix="s3://bucket/raw-images/",
+    output_prefix="s3://bucket/images-packed/",
+)
+```
+
+After packing, the dataset contains:
+
+```
+s3://bucket/imagenet-packed/
+├── _mx8/
+│   ├── manifest.tsv          # Canonical manifest
+│   └── labels.tsv            # Label ID to label name mapping
+└── [original data files]
+```
+
+## Zero-Manifest Loading
+
+For exploration and first runs, MX8 supports **zero-manifest loading** from raw S3 prefixes.
+
+```python
+import mx8
+
+# No manifest needed - MX8 scans the prefix
+loader = mx8.load(
+    "s3://bucket/raw-dataset/",
+    batch_size_samples=64,
+    max_ram_gb=12,
+    profile="balanced",
+)
+
+for batch in loader:
+    process(batch.payload)
+```
+
+### How It Works
+
+1. MX8 checks for `<prefix>/_mx8/manifest.tsv`
+2. If not found, activates scan path
+3. Pages through prefix using `ListObjectsV2`
+4. Feeds objects into bounded shuffle reservoir
+5. Batches start flowing immediately (no wait for full listing)
+6. If ImageFolder layout detected, assigns label IDs on the fly
+
+### When to Use
+
+<Tabs>
+  <Tab title="Zero-Manifest">
+    **Right for:**
+    - Exploration and first runs
+    - Ad-hoc jobs
+    - Quick experiments
+
+    **Tradeoffs:**
+    - Shuffle quality is bounded approximation
+    - Label IDs not stable across runs
+    - Startup time scales with object count
+  </Tab>
+  <Tab title="Packed Manifest">
+    **Right for:**
+    - Production workloads
+    - Reproducible experiments
+    - Multi-run comparisons
+
+    **Benefits:**
+    - Near-zero startup time
+    - Full deterministic shuffle
+    - Stable label IDs
+    - Cryptographic hash for pinning
+  </Tab>
+</Tabs>
+
+<Note>
+**Typical path:** Start with zero-manifest during development, pack once you're ready for production.
+</Note>
+
+### Configuration
+
+```bash
+# Control zero-manifest behavior
+export MX8_ZERO_MANIFEST_ENABLED=true              # Default: true
+export MX8_ZERO_MANIFEST_RESERVOIR=100000          # Default: 100k entries
+export MX8_S3_SCAN_SHUFFLE_SEED=42                 # Pin shuffle seed
+```
+
+## Snapshot Locking
+
+MX8 uses intent locks to prevent concurrent indexing:
+
+- **Lock acquired**: when a process starts indexing a prefix
+- **Lock released**: when manifest is written and intent pointer updated
+- **Stale lock threshold**: default 60 seconds (configurable via `MX8_SNAPSHOT_LOCK_STALE_MS`)
+- **Wait timeout**: default 30 seconds (configurable via `MX8_SNAPSHOT_WAIT_TIMEOUT_MS`)
+
+If another process is indexing:
+
+```python
+import mx8
+
+# First process: starts indexing
+loader1 = mx8.load("s3://bucket/dataset/@refresh")
+
+# Second process: waits for first to complete
+loader2 = mx8.load("s3://bucket/dataset/@refresh")  # Waits up to 30s
+```
+
+## Vision v1.8 Convention (Optional)
+
+For ImageFolder-style datasets:
+
+- `decode_hint="mx8:vision:imagefolder;label_id=<n>"` enables classification-style training loops to consume `label_id` without per-sample label strings
+- When packing, also write `_mx8/labels.tsv` once per dataset (`label_id<TAB>label`, percent-encoded) so users can map IDs back to strings
+
+```python
+import mx8
+
+loader = mx8.load("s3://bucket/imagenet-packed/")
+
+for batch in loader:
+    images = batch.payload       # Decoded images
+    labels = batch.label_ids     # [3, 7, 3, 12, ...]
+    train_step(images, labels)
+```
+
+## Example: Production Workflow
+
+```python
+import mx8
+
+# 1. Pack dataset once (development)
+mx8.pack_s3(
+    input_prefix="s3://company-data/raw-images/",
+    output_prefix="s3://company-data/imagenet-v2/",
+)
+
+# 2. Run training with pinned snapshot (production)
+loader = mx8.DistributedDataLoader(
+    coordinator_url="http://coordinator:50051",
+    job_id="training-resnet50-v2",
+    node_id=f"node-{rank}",
+    # Pin to exact snapshot for reproducibility
+    dataset_link="s3://company-data/imagenet-v2/@sha256:a3f2b8c9d1e4f5a6b7c8d9e0f1a2b3c4",
+    batch_size_samples=256,
+    max_ram_gb=60,
+)
+
+for epoch in range(num_epochs):
+    for batch in loader:
+        train_step(batch)
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="diagram-project" href="/concepts/architecture">
+    Understand the three-layer architecture
+  </Card>
+  <Card title="Distributed Execution" icon="network-wired" href="/concepts/distributed-execution">
+    Learn about leases and recovery
+  </Card>
+  <Card title="Packing Datasets" icon="box" href="/guides/packing-datasets">
+    Pack your first dataset
+  </Card>
+</CardGroup>

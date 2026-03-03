@@ -1,0 +1,300 @@
+---
+title: Multi-Epoch Training
+description: Patterns for training across multiple epochs with snapshot consistency
+---
+
+MX8 loaders are **single-pass**. When all samples have been delivered, the loader raises `StopIteration` and stops permanently. For multi-epoch training, you create a new loader at the start of each epoch.
+
+## Single-Pass Semantics
+
+Loaders do not restart automatically:
+
+```python
+import mx8
+
+loader = mx8.load("s3://bucket/train/", batch_size_samples=64, max_ram_gb=8)
+
+for batch in loader:
+    train_step(batch)
+
+# Loader is exhausted - calling next() again raises StopIteration
+# You must create a new loader for the next epoch
+```
+
+## Basic Multi-Epoch Pattern
+
+Create a new loader for each epoch:
+
+```python
+import mx8
+
+dataset = "s3://bucket/train@refresh"
+
+for epoch in range(10):
+    loader = mx8.load(
+        dataset,
+        batch_size_samples=64,
+        max_ram_gb=8,
+        profile="balanced",
+    )
+    for batch in loader:
+        train_step(batch)
+```
+
+<Warning>
+With `@refresh`, each epoch may see a different snapshot if the source dataset changes between epochs. For training consistency, pin the manifest hash.
+</Warning>
+
+## Pinned Snapshot for Consistency
+
+To ensure every epoch sees the **exact same snapshot**, resolve the manifest hash once before the training loop:
+
+<Steps>
+  <Step title="Resolve manifest hash once">
+    ```python
+    import mx8
+
+    # Capture dataset state at job start
+    manifest_hash = mx8.resolve_manifest_hash("s3://bucket/train@refresh")
+    pinned = f"s3://bucket/train@sha256:{manifest_hash}"
+    ```
+
+    This pins the dataset to a specific snapshot.
+  </Step>
+
+  <Step title="Create loader for each epoch">
+    ```python
+    for epoch in range(10):
+        loader = mx8.load(
+            pinned,
+            batch_size_samples=64,
+            max_ram_gb=8,
+            profile="balanced",
+        )
+        for batch in loader:
+            train_step(batch)
+    ```
+
+    All epochs use the same pinned snapshot. The dataset won't change mid-training.
+  </Step>
+</Steps>
+
+## Deterministic Ordering Across Epochs
+
+For reproducible training, control shuffling with `seed` and `epoch`:
+
+```python
+import mx8
+
+manifest_hash = mx8.resolve_manifest_hash("s3://bucket/train@refresh")
+pinned = f"s3://bucket/train@sha256:{manifest_hash}"
+
+for epoch in range(10):
+    loader = mx8.load(
+        pinned,
+        batch_size_samples=64,
+        max_ram_gb=8,
+        profile="balanced",
+        seed=42,
+        epoch=epoch,  # Different shuffle per epoch
+    )
+    for batch in loader:
+        train_step(batch)
+```
+
+For a fixed `manifest_hash`, `seed`, and `epoch`, the sample order is deterministic and reproducible.
+
+## Distributed Multi-Epoch Training
+
+In distributed mode, all ranks must create a new loader for each epoch:
+
+<CodeGroup>
+```python Single-Node Multi-GPU
+import os
+import mx8
+
+rank = int(os.environ["RANK"])
+world_size = int(os.environ["WORLD_SIZE"])
+
+manifest_hash = mx8.resolve_manifest_hash("s3://bucket/train@refresh")
+pinned = f"s3://bucket/train@sha256:{manifest_hash}"
+
+with mx8.coordinator(rank=rank, world_size=world_size) as coord:
+    for epoch in range(10):
+        loader = mx8.load(
+            pinned,
+            batch_size_samples=512,
+            max_ram_gb=24,
+            job_id=f"train-epoch-{epoch}",
+            cluster_url=coord.url,
+            seed=42,
+            epoch=epoch,
+        )
+        for batch in loader:
+            train_step(batch)
+```
+
+```python Multi-Node
+import mx8
+
+manifest_hash = mx8.resolve_manifest_hash("s3://bucket/train@refresh")
+pinned = f"s3://bucket/train@sha256:{manifest_hash}"
+
+for epoch in range(10):
+    loader = mx8.load(
+        pinned,
+        batch_size_samples=512,
+        max_ram_gb=24,
+        job_id=f"train-epoch-{epoch}",
+        cluster_url="http://coordinator-host:50051",
+        seed=42,
+        epoch=epoch,
+    )
+    for batch in loader:
+        train_step(batch)
+```
+</CodeGroup>
+
+<Note>
+Training is epoch-boundary elastic in v1. You can add/remove nodes between epochs by launching the next epoch with a new world size. Mid-epoch rank loss is non-elastic - the job must restart.
+</Note>
+
+## Epoch-Boundary Elasticity
+
+To add or remove nodes between epochs:
+
+<Steps>
+  <Step title="Complete current epoch">
+    Let all ranks finish the current epoch and exit the loader.
+  </Step>
+
+  <Step title="Change world size">
+    Launch the next epoch with a different number of ranks:
+
+    ```bash
+    # Epoch 0: 8 GPUs
+    torchrun --nproc_per_node=8 train.py --epoch=0
+
+    # Epoch 1: 16 GPUs (added 8 more)
+    torchrun --nproc_per_node=16 train.py --epoch=1
+    ```
+  </Step>
+
+  <Step title="Verify with gate test">
+    ```bash
+    ./scripts/training_epoch_boundary_gate.sh
+    ```
+  </Step>
+</Steps>
+
+## Mid-Epoch Restart and Resume
+
+If a rank fails mid-epoch, the training job terminates (non-elastic). To recover:
+
+<Steps>
+  <Step title="Save checkpoint with MX8 token">
+    ```python
+    token = loader.checkpoint()
+    torch.save({
+        "model": model.state_dict(),
+        "mx8": token,
+        "epoch": epoch,
+    }, f"ckpt-epoch-{epoch}.pt")
+    ```
+  </Step>
+
+  <Step title="Restart all ranks">
+    ```python
+    ckpt = torch.load(f"ckpt-epoch-{epoch}.pt")
+    model.load_state_dict(ckpt["model"])
+
+    loader = mx8.load(
+        pinned,
+        batch_size_samples=512,
+        max_ram_gb=24,
+        job_id=f"train-epoch-{epoch}",
+        cluster_url=coord.url,
+        resume_from=ckpt["mx8"],  # All ranks pass same token
+    )
+    ```
+  </Step>
+
+  <Step title="Verify recovery">
+    ```bash
+    ./scripts/distributed_resume_gate.sh
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+All ranks must pass the **same** `resume_from` token. Conflicting tokens are rejected by the coordinator.
+</Warning>
+
+## Loader Cleanup
+
+`loader.close()` shuts down the background pipeline immediately:
+
+```python
+for epoch in range(10):
+    loader = mx8.load(pinned, batch_size_samples=64, max_ram_gb=8)
+    for batch in loader:
+        train_step(batch)
+    loader.close()  # Explicit cleanup
+```
+
+`close()` is called automatically by `__del__` when the loader goes out of scope, so explicit cleanup is optional but recommended in long-running processes to release RAM and network connections promptly.
+
+## Complete Multi-Epoch Training Example
+
+```python
+import mx8
+import torch
+
+# Pin dataset snapshot once
+manifest_hash = mx8.resolve_manifest_hash("s3://bucket/train@refresh")
+pinned = f"s3://bucket/train@sha256:{manifest_hash}"
+
+for epoch in range(10):
+    print(f"Starting epoch {epoch}")
+    
+    # Create new loader for this epoch
+    loader = mx8.image(
+        pinned,
+        batch_size_samples=64,
+        max_ram_gb=12,
+        profile="balanced",
+        seed=42,
+        epoch=epoch,
+        augment="imagenet",
+    )
+    
+    # Training loop
+    for step, (images, labels) in enumerate(loader):
+        loss = train_step(images, labels)
+        
+        if step % 100 == 0:
+            print(f"Epoch {epoch}, Step {step}, Loss: {loss:.4f}")
+            print(mx8.stats(loader))
+        
+        if step % 1000 == 0:
+            # Save checkpoint with MX8 token
+            token = loader.checkpoint()
+            torch.save({
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "mx8": token,
+                "epoch": epoch,
+                "step": step,
+            }, f"ckpt-epoch-{epoch}-step-{step}.pt")
+    
+    # Explicit cleanup between epochs
+    loader.close()
+    
+    print(f"Completed epoch {epoch}")
+```
+
+This pattern ensures:
+- Consistent snapshot across all epochs
+- Deterministic shuffling per epoch
+- Proper cleanup between epochs
+- Checkpoint/resume support

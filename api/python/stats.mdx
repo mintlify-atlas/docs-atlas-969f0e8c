@@ -1,0 +1,313 @@
+---
+title: Stats & Monitoring
+description: Pipeline metrics and observability
+---
+
+MX8 provides detailed runtime statistics for monitoring pipeline health, throughput, and memory usage.
+
+## mx8.stats
+
+Get human-readable or raw statistics from a loader.
+
+```python
+# Human-readable snapshot
+print(mx8.stats(loader))
+
+# Raw dict
+raw = mx8.stats(loader, raw=True)
+```
+
+### Parameters
+
+<ParamField path="loader" type="mx8.Loader" required>
+  Any MX8 loader instance.
+</ParamField>
+
+<ParamField path="raw" type="bool" default="False">
+  Return raw dict instead of formatted string. When `True`, returns the same dict as `loader.stats()`.
+</ParamField>
+
+### Returns
+
+<ResponseField name="stats" type="str | dict">
+  - When `raw=False`: Formatted string with status, mode, progress, throughput, memory, and stability sections
+  - When `raw=True`: Dictionary with all raw metrics (same as `loader.stats()`)
+</ResponseField>
+
+### Example
+
+```python
+import mx8
+
+loader = mx8.load(
+    "s3://bucket/dataset/",
+    batch_size_samples=64,
+    max_ram_gb=12,
+)
+
+# Human-readable snapshot
+print(mx8.stats(loader))
+# Output:
+# Status: running
+# Mode: single-node
+# Progress: 1250/5000 samples (25%)
+# Throughput: 342 samples/sec
+# Memory: 8.2 GB / 12 GB
+# Stability: healthy
+
+# Raw dict for programmatic access
+raw = mx8.stats(loader, raw=True)
+print(f"Delivered: {raw['delivered_samples_total']} samples")
+print(f"RSS: {raw['process_rss_bytes'] / 1e9:.2f} GB")
+```
+
+<Note>
+  `mx8.stats()` is a snapshot-only function. Call it repeatedly in your training loop for live monitoring.
+</Note>
+
+---
+
+## loader.stats
+
+All loaders expose a `stats()` method that returns a dictionary of metrics.
+
+```python
+stats = loader.stats()
+```
+
+### Core Metrics
+
+These fields are available on all loaders:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `delivered_batches_total` | int | Total batches delivered |
+| `delivered_samples_total` | int | Total samples delivered |
+| `process_rss_bytes` | int | Current process RSS memory |
+| `max_process_rss_bytes` | int | Peak RSS memory |
+| `ram_high_water_bytes` | int | RAM high-water mark |
+| `elapsed_seconds` | float | Time since loader start |
+| `inflight_bytes` | int | Current inflight bytes |
+
+### Batch Jitter Metrics
+
+| Field | Description |
+|-------|-------------|
+| `batch_payload_bytes_p50` | Median batch payload size |
+| `batch_payload_bytes_p95` | 95th percentile batch size |
+| `batch_payload_bytes_p95_over_p50` | Jitter ratio (p95/p50) |
+| `batch_payload_window_size` | Sliding window size for jitter tracking |
+| `batch_jitter_slo_breaches_total` | Count of jitter SLO violations |
+| `batch_jitter_band_adjustments_total` | Adaptive band adjustment count |
+| `batch_jitter_band_lower_pct` | Lower jitter band threshold |
+| `batch_jitter_band_upper_pct` | Upper jitter band threshold |
+
+### Loader-Specific Metrics
+
+#### Text Loader
+
+```python
+loader = mx8.text(...)
+stats = loader.stats()
+```
+
+| Field | Description |
+|-------|-------------|
+| `text_sequence_length` | Token sequence length |
+| `text_stride` | Chunking stride |
+| `text_return_attention_mask` | Whether attention masks are returned |
+
+#### Audio Loader
+
+```python
+loader = mx8.audio(...)
+stats = loader.stats()
+```
+
+| Field | Description |
+|-------|-------------|
+| `audio_sample_count` | Output frame count |
+| `audio_channels` | Output channel count |
+| `audio_expected_sample_rate_hz` | Expected sample rate |
+| `audio_decode_samples_total` | Total samples decoded |
+| `audio_decode_failures_total` | Decode failures |
+| `audio_decoded_frames_total` | Total frames decoded |
+
+#### Video Loader
+
+```python
+loader = mx8.video(...)
+stats = loader.stats()
+```
+
+| Field | Description |
+|-------|-------------|
+| `video_layout` | Frame layout (e.g., "thwc") |
+| `video_dtype` | Data type (e.g., "u8") |
+| `video_colorspace` | Colorspace (e.g., "rgb24") |
+| `video_frames_per_clip` | Frames per clip |
+| `video_frame_height` | Frame height |
+| `video_frame_width` | Frame width |
+| `video_channels` | Channel count |
+| `video_clip_bytes` | Bytes per clip |
+| `video_decode_backend` | Decode backend ("cli" or "ffi") |
+| `video_decode_attempted_clips_total` | Clips attempted |
+| `video_decode_succeeded_clips_total` | Clips succeeded |
+| `video_decode_failed_total` | Decode failures |
+| `video_decode_ms_total` | Total decode time (ms) |
+| `video_runtime_autotune_enabled` | Autotune status |
+| `video_runtime_autotune_pressure` | Autotune pressure |
+| `video_runtime_autotune_adjustments_total` | Autotune adjustment count |
+
+#### Mix Loader
+
+```python
+mixed = mx8.mix(...)
+stats = mixed.stats()
+```
+
+| Field | Description |
+|-------|-------------|
+| `mix_sources` | Per-source diagnostics (manifests, delivery counters, knobs) |
+| `mix_resume_source_checkpoint_mismatch_total` | Resume checkpoint mismatches |
+
+---
+
+## Prometheus Integration
+
+Expose MX8 metrics to Prometheus:
+
+```python
+from prometheus_client import Gauge, start_http_server
+import mx8
+
+start_http_server(9090)
+
+inflight = Gauge("mx8_inflight_bytes", "MX8 pipeline inflight bytes")
+rss = Gauge("mx8_process_rss_bytes", "MX8 process RSS bytes")
+hwm = Gauge("mx8_ram_high_water_bytes", "MX8 RAM high-water mark")
+delivered = Gauge("mx8_delivered_samples", "MX8 delivered samples total")
+
+loader = mx8.load(
+    "s3://bucket/dataset/",
+    batch_size_samples=64,
+    max_ram_gb=12,
+)
+
+for batch in loader:
+    train_step(batch)
+    
+    s = loader.stats()
+    inflight.set(s["inflight_bytes"])
+    rss.set(s["process_rss_bytes"])
+    hwm.set(s["ram_high_water_bytes"])
+    delivered.set(s["delivered_samples_total"])
+```
+
+---
+
+## Datadog Integration
+
+Send MX8 metrics to Datadog:
+
+```python
+from datadog import initialize, statsd
+import mx8
+
+initialize()
+
+loader = mx8.load(
+    "s3://bucket/dataset/",
+    batch_size_samples=64,
+    max_ram_gb=12,
+)
+
+for step, batch in enumerate(loader):
+    train_step(batch)
+    
+    if step % 50 == 0:
+        s = loader.stats()
+        statsd.gauge("mx8.inflight_bytes", s["inflight_bytes"])
+        statsd.gauge("mx8.process_rss_bytes", s["process_rss_bytes"])
+        statsd.gauge("mx8.ram_high_water_bytes", s["ram_high_water_bytes"])
+        statsd.gauge("mx8.delivered_samples", s["delivered_samples_total"])
+```
+
+---
+
+## Alerting
+
+Set up alerts for:
+
+1. **Memory pressure**: `ram_high_water_bytes` approaching `MX8_MAX_PROCESS_RSS_BYTES`
+2. **Batch jitter**: `batch_jitter_slo_breaches_total` rising steadily
+3. **Inflight saturation**: `inflight_bytes` pegged at cap for many consecutive steps
+4. **Decode failures**: `audio_decode_failures_total` or `video_decode_failed_total` increasing
+
+### Example Alert Rules
+
+```yaml
+# Prometheus alert rules
+groups:
+  - name: mx8
+    rules:
+      - alert: MX8MemoryPressure
+        expr: mx8_ram_high_water_bytes / mx8_max_process_rss_bytes > 0.9
+        for: 5m
+        annotations:
+          summary: "MX8 memory usage above 90%"
+      
+      - alert: MX8BatchJitter
+        expr: rate(mx8_batch_jitter_slo_breaches_total[5m]) > 0.1
+        annotations:
+          summary: "MX8 batch jitter SLO breaches increasing"
+      
+      - alert: MX8InflightSaturation
+        expr: mx8_inflight_bytes / mx8_max_inflight_bytes > 0.95
+        for: 2m
+        annotations:
+          summary: "MX8 inflight bytes saturated"
+```
+
+---
+
+## Example: Live Stats Display
+
+```python
+import mx8
+import time
+
+loader = mx8.load(
+    "s3://bucket/dataset/",
+    batch_size_samples=64,
+    max_ram_gb=12,
+)
+
+for step, batch in enumerate(loader):
+    train_step(batch)
+    
+    # Print stats every 10 steps
+    if step % 10 == 0:
+        print(f"\n=== Step {step} ===")
+        print(mx8.stats(loader))
+```
+
+Output:
+
+```
+=== Step 0 ===
+Status: running
+Mode: single-node
+Progress: 64/10000 samples (0.6%)
+Throughput: 128 samples/sec
+Memory: 2.1 GB / 12 GB
+Stability: healthy
+
+=== Step 10 ===
+Status: running
+Mode: single-node
+Progress: 704/10000 samples (7.0%)
+Throughput: 342 samples/sec
+Memory: 4.8 GB / 12 GB
+Stability: healthy
+```

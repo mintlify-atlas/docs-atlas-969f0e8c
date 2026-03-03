@@ -1,0 +1,274 @@
+---
+title: Memory Contract
+description: Exactly what MX8 memory guarantees mean and what remains your responsibility
+---
+
+This page defines exactly what MX8 memory guarantees mean in v1.8 and what remains the operator's responsibility.
+
+## What MX8 Guarantees
+
+MX8 enforces two independent hard caps on every production-facing loader surface.
+
+### `max_inflight_bytes`
+
+Caps the bytes admitted into the MX8 pipeline — everything in the fetch, decode, and queued delivery stages. When this cap is full, backpressure engages and no new fetches start.
+
+<Info>
+This is a **strict mechanical guarantee**: MX8 will not admit more bytes than you configure.
+</Info>
+
+```python
+import mx8
+
+loader = mx8.load(
+    "s3://bucket/dataset/",
+    batch_size_samples=64,
+    max_inflight_bytes=128 * 1024 * 1024,  # 128MB
+    profile="balanced",
+)
+```
+
+### `max_ram_bytes`
+
+Caps the whole-process RSS. MX8 samples the process RSS periodically and fails fast with an explicit error if it exceeds the cap. This protects the process from being silently OOM-killed by the OS.
+
+```python
+import mx8
+
+loader = mx8.load(
+    "s3://bucket/dataset/",
+    batch_size_samples=64,
+    max_ram_gb=12,  # Whole-process RSS cap
+    profile="balanced",
+)
+```
+
+Or via environment variable:
+
+```bash
+export MX8_MAX_PROCESS_RSS_BYTES=12884901888  # 12GB
+```
+
+<Note>
+Both caps are enforced independently. You can set one or both. On production-facing loaders, MX8 derives a default process RSS cap if you do not set one explicitly.
+</Note>
+
+## The Runtime Knobs
+
+Four knobs work together to bound memory usage end to end:
+
+### `max_inflight_bytes`
+
+The pipeline byte budget. **Set this first.**
+
+- Controls total bytes in fetch, decode, and queued delivery stages
+- When full, backpressure prevents new fetches
+- Typical values: 128MB–2GB depending on batch size and object sizes
+
+### `max_queue_batches`
+
+Caps the number of delivered batches waiting to be consumed.
+
+- If your consumer is slow, this prevents the queue from growing unbounded
+- Default: 64 batches
+- Lower values reduce memory overhead but may reduce throughput if consumer has variable latency
+
+```python
+loader = mx8.load(
+    "s3://bucket/dataset/",
+    batch_size_samples=64,
+    max_queue_batches=32,  # Reduce queue depth
+)
+```
+
+### `prefetch_batches`
+
+Controls how many batches the pipeline reads ahead.
+
+- More prefetch means better throughput but more memory
+- Default: 1
+- Increase only if you observe pipeline stalls
+
+```python
+loader = mx8.load(
+    "s3://bucket/dataset/",
+    batch_size_samples=64,
+    prefetch_batches=4,  # Read ahead 4 batches
+)
+```
+
+### `want` (DistributedDataLoader)
+
+Controls how many concurrent leases this node holds.
+
+- More leases means more parallel fetch, which increases inflight pressure
+- Default: 1
+- Increase for better throughput on high-bandwidth networks
+
+```python
+import mx8
+
+loader = mx8.DistributedDataLoader(
+    coordinator_url="http://coordinator:50051",
+    job_id="prod-job-001",
+    node_id="node-0",
+    batch_size_samples=512,
+    want=2,  # Hold 2 concurrent leases
+    max_inflight_bytes=256 * 1024 * 1024,
+)
+```
+
+<Warning>
+Set these conservatively to start and increase based on observed throughput and `ram_high_water_bytes` from `loader.stats()`.
+</Warning>
+
+## What is NOT Guaranteed
+
+MX8 only owns the loader-path memory. The process also allocates for:
+
+- Model weights
+- Framework internals (PyTorch, TensorFlow, JAX)
+- Python objects
+- Anything else running in the same process
+
+If those allocations grow faster than expected, the process can still hit the RSS fail-fast cap and abort — which is the **correct behavior**. The alternative is an OS OOM kill with no warning.
+
+<Info>
+**Memory contract:** MX8 holds its portion of memory within your configured bounds. The rest is your code's responsibility.
+</Info>
+
+## Operator Checklist
+
+### 1. Set `max_inflight_bytes` Explicitly
+
+Do not rely on defaults in production.
+
+```python
+loader = mx8.load(
+    dataset,
+    max_inflight_bytes=256 * 1024 * 1024,  # Explicit
+)
+```
+
+### 2. Set `MX8_MAX_PROCESS_RSS_BYTES` as Org-Wide Policy
+
+Set this as an organization-wide policy, not per-job. This ensures consistent protection across all jobs even when individual configurations vary.
+
+```bash
+# In your deployment config or init script
+export MX8_MAX_PROCESS_RSS_BYTES=68719476736  # 64GB
+```
+
+### 3. Keep Prefetch Conservative
+
+Keep `prefetch_batches` and `max_queue_batches` conservative for the workload, especially on nodes with other heavy processes running.
+
+```python
+loader = mx8.load(
+    dataset,
+    prefetch_batches=2,      # Conservative
+    max_queue_batches=32,    # Conservative
+)
+```
+
+### 4. Monitor Real Usage
+
+Monitor `inflight_bytes`, `process_rss_bytes`, and `ram_high_water_bytes` from `loader.stats()` to understand actual usage versus configured caps.
+
+```python
+for batch in loader:
+    stats = loader.stats()
+    print(f"Inflight: {stats['inflight_bytes'] / 1e6:.1f}MB")
+    print(f"RSS: {stats['process_rss_bytes'] / 1e9:.1f}GB")
+    print(f"High water: {stats['ram_high_water_bytes'] / 1e9:.1f}GB")
+    process(batch)
+```
+
+### 5. Do Not Retain Batches
+
+Do not retain batches past the training or inference step loop. Accumulating batches in a list outside the loop bypasses the queue cap and defeats backpressure.
+
+<Warning>
+```python
+# BAD: Defeats backpressure
+batches = []
+for batch in loader:
+    batches.append(batch)  # Accumulates unbounded!
+
+# GOOD: Process and release
+for batch in loader:
+    result = model(batch.payload)
+    # batch is released here
+```
+</Warning>
+
+## Debugging Memory Issues
+
+### Symptom: Process killed by OS (OOM)
+
+**Likely cause:** Total process RSS exceeded system limits before MX8's fail-fast cap triggered.
+
+**Fix:** Set `MX8_MAX_PROCESS_RSS_BYTES` lower than the system OOM threshold.
+
+```bash
+export MX8_MAX_PROCESS_RSS_BYTES=60000000000  # 60GB on a 64GB machine
+```
+
+### Symptom: MX8 fails with "RSS cap exceeded"
+
+**Likely cause:** Non-loader allocations (model weights, framework overhead) are larger than expected.
+
+**Fix:** Either:
+1. Increase the RSS cap: `max_ram_gb=16` → `max_ram_gb=20`
+2. Reduce loader memory usage: lower `max_inflight_bytes`, `prefetch_batches`, or `batch_size_samples`
+
+### Symptom: Throughput drops over time
+
+**Likely cause:** Backpressure engaged due to slow consumer.
+
+**Fix:** Check `loader.stats()` for `inflight_bytes` near `max_inflight_bytes`. If bottleneck is consumer, optimize consumer code. If bottleneck is I/O, increase `prefetch_batches` or `want`.
+
+## Example: Configuring Memory for Training
+
+```python
+import mx8
+import torch
+
+# 64GB machine running training
+# Model weights: ~20GB
+# Framework overhead: ~4GB
+# Leave ~40GB for data loading
+
+loader = mx8.DistributedDataLoader(
+    coordinator_url="http://coordinator:50051",
+    job_id="training-job",
+    node_id=f"node-{rank}",
+    batch_size_samples=256,
+    max_inflight_bytes=2 * 1024 * 1024 * 1024,  # 2GB pipeline
+    max_queue_batches=16,                        # Bounded queue
+    prefetch_batches=2,                          # Modest prefetch
+    want=1,                                      # Single lease
+)
+
+# Org-wide policy via environment
+# export MX8_MAX_PROCESS_RSS_BYTES=60000000000  # 60GB fail-fast
+
+for epoch in range(num_epochs):
+    for batch in loader:
+        outputs = model(batch.payload)
+        loss = criterion(outputs, batch.label_ids)
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="diagram-project" href="/concepts/architecture">
+    Understand the three-layer architecture
+  </Card>
+  <Card title="Distributed Execution" icon="network-wired" href="/concepts/distributed-execution">
+    Learn about coordinator/agent model
+  </Card>
+</CardGroup>

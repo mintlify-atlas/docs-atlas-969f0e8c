@@ -1,0 +1,132 @@
+---
+title: Environment Variables Overview
+description: Complete reference for MX8 environment variables across coordinator, agent, and runtime components
+---
+
+## Overview
+
+MX8 uses environment variables prefixed with `MX8_` for all configuration. Every CLI argument has a corresponding environment variable, allowing flexible deployment across containerized and bare-metal environments.
+
+## Variable Categories
+
+Environment variables are organized by component and stability:
+
+<CardGroup cols={2}>
+  <Card title="Coordinator Variables" icon="server" href="/api/env/coordinator">
+    Control-plane configuration for the coordinator process (`MX8_COORD_*`, `MX8_WORLD_SIZE`, etc.)
+  </Card>
+  
+  <Card title="Agent Variables" icon="microchip" href="/api/env/agent">
+    Agent-specific settings for node management and data pipeline (`MX8_BATCH_SIZE_*`, `MX8_MAX_*`, etc.)
+  </Card>
+  
+  <Card title="Runtime Variables" icon="gauge-high" href="/api/env/runtime">
+    Runtime and performance tuning parameters (`MX8_MAX_INFLIGHT_BYTES`, `MX8_PREFETCH_*`, etc.)
+  </Card>
+</CardGroup>
+
+## Stability Classes
+
+All MX8 environment variables are classified by stability:
+
+- **`stable`**: Production/operator contract; backward-compatible within v1.x
+- **`experimental`**: Shipped but expected to evolve; use with caution
+- **`internal`**: Dev/gate/test-only; no compatibility guarantees
+
+<Warning>
+  Internal variables (used by demos, gates, and benchmarks) are not covered in this reference. They have no compatibility guarantees and are subject to change without notice.
+</Warning>
+
+## Common Patterns
+
+### Boolean Values
+
+Boolean environment variables accept multiple formats:
+- `true`, `false` (string)
+- `1`, `0` (numeric)
+- `yes`, `no` (for some variables)
+- `on`, `off` (for some variables)
+
+### Time Values
+
+All timing values are specified in **milliseconds** (suffix `-ms` in variable name).
+
+### Paths and URLs
+
+- Filesystem paths support `~` expansion for home directory
+- S3 paths use `s3://bucket/prefix` format
+- Azure Blob paths use `az://container/prefix` format
+- GCS paths use `gs://bucket/prefix` format
+
+### Defaults and Derivation
+
+Many variables have derived defaults based on other settings:
+- `MX8_MIN_WORLD_SIZE` defaults to `MX8_WORLD_SIZE` if set to `0`
+- `MX8_COORD_HA_LEASE_PATH` derives from `MX8_MANIFEST_STORE_ROOT`
+- `MX8_LEASE_LOG_PATH` derives from `MX8_MANIFEST_STORE_ROOT`
+
+## Production Baseline
+
+Before running any production job, explicitly set:
+
+<CodeGroup>
+```bash Coordinator
+MX8_WORLD_SIZE=<node-count>
+MX8_DATASET_LINK='s3://bucket/dataset/@refresh'
+MX8_MANIFEST_STORE_ROOT='s3://bucket/manifests/'
+MX8_GRPC_MAX_MESSAGE_BYTES=67108864
+```
+
+```bash Agent
+MX8_COORD_URL='http://coordinator-host:50051'
+MX8_JOB_ID='<unique-job-id>'
+MX8_NODE_ID='<stable-node-id>'
+MX8_MAX_PROCESS_RSS_BYTES=<policy-default>
+MX8_GRPC_MAX_MESSAGE_BYTES=67108864
+```
+</CodeGroup>
+
+<Warning>
+  **Never** rely on unpinned dataset paths in production. Always use `@refresh` or `@sha256:<hash>` suffixes with `MX8_DATASET_LINK`.
+</Warning>
+
+## Cloud Storage Configuration
+
+### S3
+
+- `MX8_S3_ENDPOINT_URL`: Override for S3-compatible services (MinIO, LocalStack)
+- `MX8_S3_FORCE_PATH_STYLE`: Force path-style addressing (auto-enabled with endpoint override)
+
+### Azure Blob Storage
+
+- `MX8_AZURE_ENDPOINT_URL`: Azure or emulator endpoint
+- `MX8_AZURE_ANONYMOUS`: Enable anonymous access (default: `false`)
+
+### Google Cloud Storage
+
+- `MX8_GCS_ENDPOINT_URL`: GCS emulator or custom endpoint
+- `MX8_GCS_ANONYMOUS`: Enable anonymous access (default: `false`)
+
+## Logging
+
+`MX8_LOG` controls Rust tracing output. Falls back to `RUST_LOG`, then defaults to `info`.
+
+<CodeGroup>
+```bash Info Level (Default)
+MX8_LOG=info
+```
+
+```bash Debug Coordinator Only
+MX8_LOG=mx8_coordinator=debug,info
+```
+
+```bash Trace All MX8 Crates
+MX8_LOG=mx8=trace
+```
+</CodeGroup>
+
+## Related Resources
+
+- [Deployment Guide](/guides/deployment) - Step-by-step deployment walkthrough
+- [Production Runbook](/operations/production-runbook) - Operational procedures and troubleshooting
+- [CLI Overview](/api/cli/overview) - Command-line interface documentation

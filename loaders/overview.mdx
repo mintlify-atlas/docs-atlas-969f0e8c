@@ -1,0 +1,174 @@
+---
+title: "Data Loaders Overview"
+description: "Overview of MX8's specialized data loaders for bytes, text, images, audio, video, and multi-dataset mixing"
+---
+
+## Introduction
+
+MX8 provides a family of specialized loaders designed for different modalities and use cases. All loaders share a common memory management model, distributed execution support, and checkpoint/resume capabilities.
+
+## Loader Types
+
+<CardGroup cols={2}>
+  <Card title="Byte Loader" icon="binary" href="/loaders/bytes">
+    Core `mx8.load()` API for raw byte streaming
+  </Card>
+  <Card title="Text Loader" icon="font" href="/loaders/text">
+    `mx8.text()` with built-in tokenization
+  </Card>
+  <Card title="Image Loader" icon="image" href="/loaders/image">
+    `mx8.image()` with decode and augmentation
+  </Card>
+  <Card title="Audio Loader" icon="waveform" href="/loaders/audio">
+    `mx8.audio()` for audio preprocessing
+  </Card>
+  <Card title="Video Loader" icon="video" href="/loaders/video">
+    `mx8.video()` for clip-based video loading
+  </Card>
+  <Card title="Mix API" icon="shuffle" href="/loaders/mix">
+    `mx8.mix()` for multi-dataset blending
+  </Card>
+</CardGroup>
+
+## Common Features
+
+All MX8 loaders share these capabilities:
+
+### Memory Safety
+
+- **Bounded memory** with explicit `max_ram_gb` limits
+- **Fail-fast RSS caps** to prevent OOM kills
+- **Profile-based defaults**: `safe`, `balanced`, or `throughput`
+
+```python
+loader = mx8.load(
+    "s3://bucket/data/",
+    max_ram_gb=12,
+    profile="balanced",
+)
+```
+
+### Distributed Execution
+
+All loaders support distributed attach with automatic shard coordination:
+
+```python
+loader = mx8.load(
+    "s3://bucket/data/",
+    batch_size_samples=512,
+    max_ram_gb=24,
+    job_id="train-001",
+    cluster_url="http://coordinator-host:50051",
+)
+```
+
+Or via environment variables:
+
+```bash
+export MX8_JOB_ID="train-001"
+export MX8_CLUSTER_URL="http://coordinator-host:50051"
+```
+
+### Snapshot Pinning
+
+Pin exact dataset versions with manifest hash:
+
+```python
+# Resolve once at job start
+manifest_hash = mx8.resolve_manifest_hash("s3://bucket/data@refresh")
+pinned = f"s3://bucket/data@sha256:{manifest_hash}"
+
+# Use pinned version across epochs
+for epoch in range(10):
+    loader = mx8.load(pinned, batch_size_samples=64, max_ram_gb=12)
+    for batch in loader:
+        train_step(batch)
+```
+
+### Checkpoint & Resume
+
+All loaders support opaque checkpoint tokens:
+
+```python
+token = loader.checkpoint()
+
+# Resume from checkpoint
+loader = mx8.load(
+    "s3://bucket/data/",
+    batch_size_samples=64,
+    max_ram_gb=12,
+    resume_from=token,
+)
+```
+
+### Stats & Monitoring
+
+Every loader exposes runtime statistics:
+
+```python
+for batch in loader:
+    train_step(batch)
+    
+    # Human-readable snapshot
+    print(mx8.stats(loader))
+    
+    # Raw metrics dict
+    metrics = loader.stats()
+    print(metrics["delivered_samples_total"])
+    print(metrics["ram_high_water_bytes"])
+```
+
+## Multi-Epoch Training
+
+<Warning>
+Loaders are **single-pass**. They raise `StopIteration` when exhausted and do not restart automatically.
+</Warning>
+
+Create a new loader at the start of each epoch:
+
+```python
+import mx8
+
+dataset = "s3://bucket/train@refresh"
+
+for epoch in range(10):
+    loader = mx8.load(dataset, batch_size_samples=64, max_ram_gb=8, profile="balanced")
+    for batch in loader:
+        train_step(batch)
+```
+
+For reproducible multi-epoch training, pin the manifest hash before the loop:
+
+```python
+manifest_hash = mx8.resolve_manifest_hash("s3://bucket/train@refresh")
+pinned = f"s3://bucket/train@sha256:{manifest_hash}"
+
+for epoch in range(10):
+    loader = mx8.load(pinned, batch_size_samples=64, max_ram_gb=8)
+    for batch in loader:
+        train_step(batch)
+```
+
+## Resource Cleanup
+
+Call `loader.close()` to release resources immediately:
+
+```python
+loader = mx8.load("s3://bucket/data/", batch_size_samples=64, max_ram_gb=12)
+for batch in loader:
+    train_step(batch)
+loader.close()  # Explicit cleanup
+```
+
+Cleanup happens automatically when the loader goes out of scope, but explicit `close()` is recommended in long-running processes.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Byte Loader" icon="binary" href="/loaders/bytes">
+    Start with the core byte loader
+  </Card>
+  <Card title="Mix API" icon="shuffle" href="/loaders/mix">
+    Blend multiple datasets
+  </Card>
+</CardGroup>

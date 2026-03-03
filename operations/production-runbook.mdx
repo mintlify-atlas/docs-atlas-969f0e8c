@@ -1,0 +1,223 @@
+---
+title: Production Runbook
+description: Production operations guide for MX8 deployments
+---
+
+This runbook maps common operator symptoms to checks, actions, and escalation paths. Keep it open during production jobs.
+
+<Warning>
+Before any new deployment, run the readiness suite:
+```bash
+./scripts/prod_readiness.sh
+```
+</Warning>
+
+## Prerequisites
+
+Have these identifiers ready when investigating a live job:
+- `MX8_COORD_URL`
+- `MX8_JOB_ID`
+- Node IDs or ranks involved
+- Pinned `manifest_hash`
+
+## Stale Heartbeat
+
+One or more nodes show a stale heartbeat age in the TUI or operator logs. Progress slows while active leases remain open.
+
+### Diagnosis
+
+Start by checking the TUI:
+
+```bash
+cargo run -p mx8-tui -- \
+  --coord-url "$MX8_COORD_URL" \
+  --job-id "$MX8_JOB_ID" \
+  --headless-polls 6 \
+  --poll-ms 300
+```
+
+Look for nodes with `hb_age_ms` above the stale threshold and active leases with no progress counter movement.
+
+### Resolution
+
+1. Verify that the node process is alive and has network reachability to the coordinator
+2. Restart only the stale node's agent
+3. Wait for the lease TTL to expire and the coordinator to requeue the remainder
+4. You should see `ranges_requeued_total` increment and progress resume
+
+<Warning>
+If stale heartbeats persist across two full lease TTL cycles, drain the job and restart the coordinator and agents for that job.
+</Warning>
+
+## Lease Stall
+
+Leases are active but the progress cursor is not advancing. The job appears to be running but no data is being delivered.
+
+### Diagnosis
+
+Confirm that workers are delivering, not just fetching and decoding. A lease can show activity at the fetch stage while being stalled at delivery.
+
+### Resolution
+
+1. Force-restart the stuck worker process on the affected node
+2. Let the coordinator expire and reassign the lease
+3. You should see `leases_expired_total` and `ranges_requeued_total` rise
+4. The job should return to a progressing or drained state
+
+<Warning>
+If the cursor remains unchanged after the lease is requeued and reassigned, stop the job and relaunch from the pinned snapshot.
+</Warning>
+
+## Manifest Fetch Failure
+
+The TUI or client logs show manifest fetch errors. Startup fails to resolve the manifest or stream chunks.
+
+### Diagnosis
+
+Check the TUI:
+
+```bash
+cargo run -p mx8-tui -- \
+  --coord-url "$MX8_COORD_URL" \
+  --job-id "$MX8_JOB_ID" \
+  --headless-polls 6 \
+  --poll-ms 300
+```
+
+Validate that the manifest exists in the configured `manifest_store` and that the coordinator can serve `GetManifestStream`.
+
+### Temporary Mitigation
+
+Point the TUI at a local manifest file:
+
+```bash
+cargo run -p mx8-tui -- \
+  --coord-url "$MX8_COORD_URL" \
+  --job-id "$MX8_JOB_ID" \
+  --manifest-path /path/to/manifest.tsv
+```
+
+If the manifest panel populates with the local file, the issue is with the coordinator's access to the manifest store, not the manifest itself.
+
+### Resolution
+
+If you suspect manifest mismatch or corruption, restart the run from an explicit pinned link using `@sha256:<manifest_hash>`.
+
+## RSS Breach and Memory Pressure
+
+The loader fails fast with an error like `process rss ... exceeds max_process_rss_bytes`. This is expected behavior — MX8 is protecting the process from being OOM-killed by the OS.
+
+### Diagnosis
+
+Find the cap source by checking the loader startup logs for:
+- `MX8_MAX_PROCESS_RSS_BYTES`
+- `max_ram_bytes`
+- The derived default
+
+### Resolution
+
+1. Reduce pressure by lowering these parameters:
+   - `max_inflight_bytes`
+   - `prefetch_batches`
+   - `max_queue_batches`
+   - `want` on distributed loaders
+2. Rerun with the corrected values
+
+<Warning>
+If you need to raise the cap to maintain throughput, raise it in bounded increments and rerun the readiness gates each time.
+</Warning>
+
+## Resume Token Rejection
+
+`RegisterNode` fails with errors like:
+- `invalid resume_from token`
+- `resume_from manifest_hash mismatch`
+- `resume_from epoch mismatch`
+- `conflicting resume_from token`
+- `cannot apply resume checkpoint after lease issuance has started`
+
+### Diagnosis
+
+Verify coordinator counters in the TUI:
+- A rising `resume_reject` confirms bad or late resume tokens
+- `resume_ok` should increase only when the checkpoint is accepted
+
+### Resolution
+
+Enforce one token source for the whole job. Every rank must load the exact same checkpoint artifact and pass the same `resume_from` bytes at loader construction time.
+
+**If leases were already issued:**
+1. Stop all ranks
+2. Restart the coordinator for a clean run
+3. Relaunch all ranks with `resume_from` set before any data requests
+
+**If manifest/epoch mismatch:**
+Ensure the restart uses the same pinned dataset (`@sha256:<manifest_hash>`) and epoch as the checkpoint-producing run.
+
+**If rejections continue:**
+Relaunch without `resume_from` and treat it as a fresh epoch run. Preserve the failed token and coordinator log for incident review.
+
+## Coordinator Failure
+
+In default v1.8 deployments, coordinator leader-fencing + durable state replay are enabled. If the active leader dies, a follower should take over when shared lease/state paths are configured correctly.
+
+### Resolution
+
+1. Restart the coordinator for the affected job
+2. Restart affected agents if they do not reconnect on their own
+3. Verify recovery in the TUI:
+
+```bash
+cargo run -p mx8-tui -- \
+  --coord-url "$MX8_COORD_URL" \
+  --job-id "$MX8_JOB_ID" \
+  --headless-polls 6 \
+  --poll-ms 300
+```
+
+You should see:
+- Nodes re-register
+- Heartbeats resume
+- Progress counters start moving again
+
+<Warning>
+If the coordinator repeatedly fails or the job cannot resume progress, drain it and relaunch from a pinned `@sha256:<manifest_hash>`.
+</Warning>
+
+### HA Configuration
+
+When lease logging is enabled (default for non-dev manifest hashes), restart recovery replays durable completion and durable progress cursors. This means partially completed ranges should resume near their previous cursor instead of restarting from the full block.
+
+Mutating RPCs are fenced on followers/stale leaders with `FAILED_PRECONDITION` and a `not leader for mutating operation` message. In that case, direct agents to the active lease holder or wait for leader lease transition before retrying.
+
+**If HA is enabled:**
+Keep `MX8_COORD_STATE_STORE_PATH` on a shared durable filesystem visible to all candidate coordinators. If this path is not shared, leader transition can fence stale writers but cannot continue from latest shared state.
+
+The HA contract is documented in `/operations/high-availability`.
+
+## Training v1 Boundary Model
+
+Training support is epoch-boundary elastic only.
+
+### Mid-Epoch Rank Failure
+
+If a rank dies mid-epoch, treat it as a restart event:
+1. Save or recover the distributed loader checkpoint token (`loader.checkpoint()`)
+2. Relaunch all ranks
+3. Pass the same `resume_from` token before any rank requests leases
+
+### Node Scaling
+
+To add or remove nodes, do it only at epoch boundaries by launching the next epoch with the new world size.
+
+Validate this behavior with:
+
+```bash
+./scripts/training_epoch_boundary_gate.sh
+```
+
+## Related Resources
+
+- [Troubleshooting](/operations/troubleshooting) - Common errors and fixes
+- [High Availability](/operations/high-availability) - HA setup and failover
+- [Security](/operations/security) - Security model and best practices

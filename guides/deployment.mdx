@@ -1,0 +1,264 @@
+---
+title: Deployment Guide
+description: Deploy MX8 coordinator and agents for distributed workloads
+---
+
+This guide explains how to run a distributed MX8 job with one coordinator process and one agent per node.
+
+## Architecture Overview
+
+A typical MX8 deployment has:
+
+- **One coordinator process**: Manages leases, dataset ownership, and job control plane
+- **One agent per node**: Enforces local memory caps and feeds work ranges to runtimes
+- **Shared manifest store**: S3 prefix or filesystem path accessible to coordinator and agents
+
+<Note>
+The coordinator only serves control-plane traffic and manifest bytes. It never proxies dataset data. Agents and runtimes fetch data directly from storage.
+</Note>
+
+## Key Deployment Constraints
+
+- **v1.8 default**: Coordinator leader-fencing and durable state replay enabled
+- **Training elasticity**: Non-elastic in v1.8 - if a DDP rank dies, the training job terminates
+- **Recovery model**: Lease reassignment handles inference and ETL recovery, not training node loss
+
+## Topology
+
+The coordinator binds a gRPC port (default `0.0.0.0:50051`) that every agent connects to. Each agent:
+
+- Runs on one node
+- Talks to coordinator for leases, heartbeats, and progress reporting
+- Fetches data directly from storage (S3, filesystem)
+
+<Warning>
+Place the coordinator on a node with a stable network path to every agent and to the manifest store. Default heartbeat interval is 1 second - network reliability matters more than raw latency.
+</Warning>
+
+## Deployment Steps
+
+<Steps>
+  <Step title="Build binaries">
+    ```bash
+    cargo build -p mx8-coordinator --features s3
+    cargo build -p mx8d-agent --features s3
+    ```
+
+    If you're using filesystem-only datasets and a local manifest store, omit `--features s3`.
+  </Step>
+
+  <Step title="Start coordinator">
+    ```bash
+    MX8_COORD_BIND_ADDR=0.0.0.0:50051 \
+    MX8_WORLD_SIZE=8 \
+    MX8_DATASET_LINK='s3://your-bucket/dataset/@refresh' \
+    MX8_MANIFEST_STORE_ROOT='s3://your-bucket/manifests/' \
+    target/release/mx8-coordinator
+    ```
+
+    The coordinator will:
+    - Bind to the specified address
+    - Wait for 8 agents to register (world size)
+    - Resolve or create a manifest snapshot for the dataset
+  </Step>
+
+  <Step title="Start agents on each node">
+    ```bash
+    MX8_COORD_URL='http://coordinator-host:50051' \
+    MX8_JOB_ID='prod-job-001' \
+    MX8_NODE_ID='node-0' \
+    MX8_BATCH_SIZE_SAMPLES=512 \
+    MX8_MAX_INFLIGHT_BYTES=134217728 \
+    MX8_MAX_PROCESS_RSS_BYTES=68719476736 \
+    target/release/mx8d-agent
+    ```
+
+    Repeat for each node with unique `MX8_NODE_ID` values.
+  </Step>
+
+  <Step title="Verify with TUI">
+    ```bash
+    cargo run -p mx8-tui -- \
+      --coord-url http://coordinator-host:50051 \
+      --job-id prod-job-001
+    ```
+
+    The TUI shows:
+    - Node registration status
+    - Active leases and progress
+    - Heartbeat health
+    - Job-level metrics
+  </Step>
+</Steps>
+
+## Coordinator Configuration
+
+Every CLI argument has a corresponding environment variable. All timing values are in milliseconds.
+
+### Core Settings
+
+| Environment Variable | Default | Description |
+| -------------------- | ------- | ----------- |
+| `MX8_COORD_BIND_ADDR` | `0.0.0.0:50051` | gRPC bind address |
+| `MX8_WORLD_SIZE` | `1` | Membership barrier - job freezes at this count |
+| `MX8_DATASET_LINK` | unset | Plain path, `@refresh`, or `@sha256:<hash>` |
+| `MX8_MANIFEST_STORE_ROOT` | `~/.mx8/manifests` | Filesystem path or S3 prefix |
+
+### Lease and Heartbeat Tuning
+
+| Environment Variable | Default | Description |
+| -------------------- | ------- | ----------- |
+| `MX8_HEARTBEAT_INTERVAL_MS` | `1000` | Heartbeat cadence returned to agents |
+| `MX8_LEASE_TTL_MS` | `10000` | Time before silent lease expires |
+| `MX8_SNAPSHOT_LOCK_STALE_MS` | `60000` | Stale threshold for snapshot locks |
+| `MX8_SNAPSHOT_WAIT_TIMEOUT_MS` | `30000` | Wait time for concurrent indexer |
+
+### High Availability
+
+| Environment Variable | Default | Description |
+| -------------------- | ------- | ----------- |
+| `MX8_COORD_HA_ENABLE` | `true` | Enable lease-file leader fencing |
+| `MX8_COORD_HA_LEASE_PATH` | `<manifest_store>/../ha/<hash>.leader_lease` | Shared leader lease file |
+| `MX8_COORD_HA_LEADER_ID` | `<hostname>-<pid>` | Coordinator identity |
+| `MX8_COORD_HA_LEASE_TTL_MS` | `5000` | Leader lease TTL |
+| `MX8_COORD_HA_RENEW_INTERVAL_MS` | `1000` | Leader lease renew cadence |
+| `MX8_COORD_STATE_STORE_ENABLE` | `true` | Enable durable shared state snapshots |
+| `MX8_COORD_STATE_STORE_PATH` | `<manifest_store>/../state/<hash>.json` | Shared state snapshot file |
+
+### Deterministic Ordering
+
+| Environment Variable | Default | Description |
+| -------------------- | ------- | ----------- |
+| `MX8_SHUFFLE` | `false` | Enable deterministic block shuffle |
+| `MX8_SEED` | `0` | Shuffle seed |
+| `MX8_EPOCH` | `0` | Epoch input for deterministic ordering |
+
+## Agent Configuration
+
+| Environment Variable | Default | Description |
+| -------------------- | ------- | ----------- |
+| `MX8_COORD_URL` | `http://127.0.0.1:50051` | Coordinator address |
+| `MX8_JOB_ID` | `local-job` | Must match coordinator job |
+| `MX8_NODE_ID` | `local-node` | Stable identity for this node |
+| `MX8_BATCH_SIZE_SAMPLES` | `512` | Samples per batch |
+| `MX8_PREFETCH_BATCHES` | `1` | Pipeline read-ahead depth |
+| `MX8_MAX_QUEUE_BATCHES` | `64` | Delivered queue cap |
+| `MX8_MAX_INFLIGHT_BYTES` | `134217728` | Pipeline byte budget (128MB) |
+| `MX8_MAX_PROCESS_RSS_BYTES` | unset | Whole-process RSS fail-fast cap |
+| `MX8_PROGRESS_INTERVAL_MS` | `500` | Progress reporting frequency |
+| `MX8_GRPC_MAX_MESSAGE_BYTES` | `67108864` | Must match coordinator (64MB) |
+
+<Warning>
+`MX8_GRPC_MAX_MESSAGE_BYTES` must be set to the same value on coordinator and all agents.
+</Warning>
+
+## Failure and Restart Behavior
+
+### Agent Failure
+
+<Steps>
+  <Step title="Agent dies or stops heartbeating">
+    Coordinator waits for lease TTL to expire (default 10 seconds).
+  </Step>
+
+  <Step title="Coordinator requeues unfinished range">
+    The range `[cursor, end)` is made available to other agents.
+  </Step>
+
+  <Step title="Remaining agents pick up work">
+    No manual intervention needed unless agent doesn't come back.
+  </Step>
+</Steps>
+
+To restart a failed agent:
+
+```bash
+MX8_COORD_URL='http://coordinator-host:50051' \
+MX8_JOB_ID='prod-job-001' \
+MX8_NODE_ID='node-0' \
+target/release/mx8d-agent
+```
+
+Verify in TUI that heartbeats resume and requeued range is picked up.
+
+### Coordinator Failure
+
+In v1.8 with HA enabled:
+
+<CodeGroup>
+```bash Verify Shared Paths
+# Ensure all candidates share these paths
+echo $MX8_COORD_HA_LEASE_PATH
+echo $MX8_COORD_STATE_STORE_PATH
+```
+
+```bash Restart Coordinator
+MX8_COORD_BIND_ADDR=0.0.0.0:50051 \
+MX8_WORLD_SIZE=8 \
+MX8_DATASET_LINK='s3://bucket/dataset/@refresh' \
+target/release/mx8-coordinator
+```
+
+```bash Verify Recovery
+cargo run -p mx8-tui -- \
+  --coord-url http://coordinator-host:50051 \
+  --job-id prod-job-001
+```
+</CodeGroup>
+
+You should see:
+- Nodes re-register
+- Heartbeats resume
+- Progress counters start moving
+
+<Note>
+When lease logging is enabled (default for non-dev manifests), restart recovery replays durable completion and progress cursors. Partially completed ranges resume near their previous cursor instead of restarting from the full block.
+</Note>
+
+## Production Baseline
+
+Before running any production job, set these explicitly:
+
+<AccordionGroup>
+  <Accordion title="Memory Cap Policy">
+    `MX8_MAX_PROCESS_RSS_BYTES` should be set as an org-wide policy default, not left to per-job ad-hoc values.
+  </Accordion>
+
+  <Accordion title="World Size">
+    Use `MX8_WORLD_SIZE` explicitly rather than relying on the default.
+  </Accordion>
+
+  <Accordion title="Dataset Pinning">
+    Use `MX8_DATASET_LINK` with `@refresh` or pinned `@sha256:` hash - never rely on unpinned plain prefix for production.
+  </Accordion>
+
+  <Accordion title="Durable Storage">
+    Back `MX8_MANIFEST_STORE_ROOT` by S3 or durable disk, not local ephemeral storage.
+  </Accordion>
+
+  <Accordion title="Message Size Alignment">
+    Set `MX8_GRPC_MAX_MESSAGE_BYTES` to the same value on coordinator and all agents.
+  </Accordion>
+</AccordionGroup>
+
+### Readiness Check
+
+Run the readiness suite before any new deployment:
+
+```bash
+./scripts/prod_readiness.sh
+```
+
+## Testing Distributed Recovery
+
+For deterministic local recovery test:
+
+```bash
+./scripts/demo2_local.sh
+```
+
+For distributed S3-compatible validation using MinIO:
+
+```bash
+./scripts/demo2_minio.sh
+```

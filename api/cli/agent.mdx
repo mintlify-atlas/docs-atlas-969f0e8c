@@ -1,0 +1,272 @@
+---
+title: mx8d-agent
+description: Worker process for executing MX8 data pipeline tasks on each node
+---
+
+The `mx8d-agent` binary runs on each worker node in a distributed MX8 deployment. It connects to the coordinator, requests leases for work ranges, enforces local memory caps, and feeds batches to the data pipeline runtime.
+
+## Usage
+
+```bash
+mx8d-agent [OPTIONS]
+```
+
+All arguments can be provided via CLI flags or environment variables. Environment variables use the `MX8_` prefix.
+
+## Core Configuration
+
+### Coordinator Connection
+
+| Flag | Environment Variable | Default | Description |
+|------|---------------------|---------|-------------|
+| `--coord-url` | `MX8_COORD_URL` | `http://127.0.0.1:50051` | Coordinator address |
+| `--grpc-max-message-bytes` | `MX8_GRPC_MAX_MESSAGE_BYTES` | `67108864` | gRPC message size cap (must match coordinator) |
+
+### Job Identity
+
+| Flag | Environment Variable | Default | Description |
+|------|---------------------|---------|-------------|
+| `--job-id` | `MX8_JOB_ID` | `local-job` | Job identifier (must match coordinator) |
+| `--node-id` | `MX8_NODE_ID` | `local-node` | Stable identity for this node |
+
+## Pipeline Configuration
+
+### Batch Processing
+
+| Flag | Environment Variable | Default | Description |
+|------|---------------------|---------|-------------|
+| `--batch-size-samples` | `MX8_BATCH_SIZE_SAMPLES` | `512` | Samples per batch |
+| `--target-batch-bytes` | `MX8_TARGET_BATCH_BYTES` | unset | Optional byte target per batch |
+| `--max-batch-bytes` | `MX8_MAX_BATCH_BYTES` | unset | Optional hard byte cap per batch |
+
+### Prefetch & Queuing
+
+| Flag | Environment Variable | Default | Description |
+|------|---------------------|---------|-------------|
+| `--prefetch-batches` | `MX8_PREFETCH_BATCHES` | `1` | Pipeline read-ahead depth |
+| `--max-queue-batches` | `MX8_MAX_QUEUE_BATCHES` | `64` | Delivered queue capacity |
+
+### Memory Management
+
+| Flag | Environment Variable | Default | Description |
+|------|---------------------|---------|-------------|
+| `--max-inflight-bytes` | `MX8_MAX_INFLIGHT_BYTES` | `134217728` | Pipeline byte budget (128MB) |
+| `--max-process-rss-bytes` | `MX8_MAX_PROCESS_RSS_BYTES` | unset | Whole-process RSS fail-fast cap |
+
+## Progress Reporting
+
+| Flag | Environment Variable | Default | Description |
+|------|---------------------|---------|-------------|
+| `--progress-interval-ms` | `MX8_PROGRESS_INTERVAL_MS` | `500` | How often to report cursor progress |
+
+## Development Options
+
+| Flag | Environment Variable | Default | Description |
+|------|---------------------|---------|-------------|
+| `--dev-lease-want` | `MX8_DEV_LEASE_WANT` | `0` | Dev-only continuous lease loop (0 disables) |
+| `--sink-sleep-ms` | `MX8_SINK_SLEEP_MS` | `0` | Dev-only artificial delivery delay |
+
+## Observability
+
+| Flag | Environment Variable | Default | Description |
+|------|---------------------|---------|-------------|
+| `--metrics-snapshot-interval-ms` | `MX8_METRICS_SNAPSHOT_INTERVAL_MS` | `0` | Periodic metrics log interval (0 disables) |
+
+## Environment-Only Configuration
+
+These settings are controlled only via environment variables (no CLI flag):
+
+| Environment Variable | Default | Description |
+|---------------------|---------|-------------|
+| `MX8_AGENT_MANIFEST_STREAM_MAX_LINE_BYTES` | `8388608` | Max manifest line length (8MB) |
+
+## Examples
+
+### Minimal local agent
+
+```bash
+mx8d-agent \
+  --coord-url http://127.0.0.1:50051 \
+  --job-id local-job \
+  --node-id node-0
+```
+
+### Production agent with memory limits
+
+```bash
+MX8_COORD_URL='http://coordinator.prod.internal:50051' \
+MX8_JOB_ID='training-run-2024-03' \
+MX8_NODE_ID="node-${HOSTNAME}" \
+MX8_BATCH_SIZE_SAMPLES=512 \
+MX8_PREFETCH_BATCHES=2 \
+MX8_MAX_QUEUE_BATCHES=64 \
+MX8_MAX_INFLIGHT_BYTES=134217728 \
+MX8_MAX_PROCESS_RSS_BYTES=68719476736 \
+mx8d-agent
+```
+
+### High-throughput agent with increased prefetch
+
+```bash
+mx8d-agent \
+  --coord-url http://coordinator:50051 \
+  --job-id inference-job \
+  --node-id gpu-node-1 \
+  --batch-size-samples 1024 \
+  --prefetch-batches 4 \
+  --max-inflight-bytes 268435456 \
+  --max-queue-batches 128
+```
+
+### Development with continuous lease requests
+
+```bash
+mx8d-agent \
+  --coord-url http://127.0.0.1:50051 \
+  --job-id demo-job \
+  --node-id demo-node \
+  --dev-lease-want 2 \
+  --batch-size-samples 256
+```
+
+## Startup Order
+
+1. Ensure the coordinator is running and reachable
+
+2. Build the agent binary:
+   ```bash
+   cargo build -p mx8d-agent --features s3 --release
+   ```
+
+3. Start one agent on each node:
+   ```bash
+   target/release/mx8d-agent
+   ```
+
+4. Verify registration in coordinator logs:
+   ```bash
+   grep "register_node" coordinator.log
+   ```
+
+5. Monitor agent heartbeats:
+   ```bash
+   grep "heartbeat_ok" agent.log
+   ```
+
+## Failure & Restart Behavior
+
+When an agent dies:
+
+1. Coordinator detects missing heartbeats
+2. After lease TTL expires (default 10s), unfinished work is requeued
+3. Other agents pick up the requeued ranges
+4. No manual intervention required
+
+To restart a failed agent:
+
+```bash
+# Bring agent back with same job-id and node-id
+MX8_JOB_ID='prod-job-001' \
+MX8_NODE_ID='node-0' \
+mx8d-agent
+```
+
+Verify recovery in TUI:
+
+```bash
+mx8-tui --coord-url http://coordinator:50051 --job-id prod-job-001
+```
+
+Check that:
+- Node appears in runtime panel
+- Heartbeat age is recent
+- Lease count increases
+
+## Memory Management
+
+### Inflight Bytes Budget
+
+`MX8_MAX_INFLIGHT_BYTES` controls the pipeline memory budget for fetched but not yet delivered data. This prevents unbounded memory growth during prefetch.
+
+**Recommended values:**
+- Small nodes (< 16GB RAM): `67108864` (64MB)
+- Medium nodes (16-64GB RAM): `134217728` (128MB)
+- Large nodes (> 64GB RAM): `268435456` (256MB)
+
+### Process RSS Limit
+
+`MX8_MAX_PROCESS_RSS_BYTES` enforces a hard fail-fast cap on the entire agent process RSS. When exceeded, the agent terminates cleanly.
+
+**Recommended values:**
+- Set to 80-90% of node's available memory
+- Account for OS overhead and other processes
+- Example for 128GB node: `103079215104` (96GB)
+
+Org-wide policy recommendation:
+
+```bash
+# Set as percentage of total RAM
+TOTAL_RAM_BYTES=$(free -b | awk '/^Mem:/ {print $2}')
+export MX8_MAX_PROCESS_RSS_BYTES=$((TOTAL_RAM_BYTES * 80 / 100))
+```
+
+## Progress Reporting
+
+Agents report progress periodically during lease execution:
+
+- `cursor`: Current sample ID position
+- `delivered_samples`: Total samples delivered to sink
+- `delivered_bytes`: Total bytes delivered to sink
+
+Progress interval affects:
+- Coordinator visibility into stuck leases
+- Recovery granularity on failure
+- Network overhead
+
+**Recommended values:**
+- Fast jobs (< 1 hour): `500` ms
+- Medium jobs (1-12 hours): `1000` ms
+- Long jobs (> 12 hours): `2000` ms
+
+## Manifest Streaming
+
+Agents fetch manifest records from the coordinator using streaming RPC when available. This reduces memory usage for large manifests.
+
+If the coordinator doesn't support streaming, agents fall back to unary RPC automatically. Check logs for:
+
+```
+event="manifest_direct_stream_used"
+```
+
+or
+
+```
+event="manifest_direct_stream_fallback"
+```
+
+Control max line length with:
+
+```bash
+export MX8_AGENT_MANIFEST_STREAM_MAX_LINE_BYTES=16777216  # 16MB
+```
+
+## Production Checklist
+
+Before deploying agents to production:
+
+- [ ] Set `MX8_JOB_ID` to match coordinator job
+- [ ] Use unique `MX8_NODE_ID` per node (e.g., hostname)
+- [ ] Set `MX8_MAX_PROCESS_RSS_BYTES` according to org policy
+- [ ] Configure `MX8_MAX_INFLIGHT_BYTES` based on node RAM
+- [ ] Set `MX8_GRPC_MAX_MESSAGE_BYTES` to match coordinator
+- [ ] Tune `MX8_BATCH_SIZE_SAMPLES` for your workload
+- [ ] Adjust `MX8_PREFETCH_BATCHES` for throughput vs memory tradeoff
+- [ ] Configure `MX8_PROGRESS_INTERVAL_MS` for job duration
+- [ ] Enable metrics logging with `MX8_METRICS_SNAPSHOT_INTERVAL_MS`
+- [ ] Test failure recovery with `./scripts/demo2_minio.sh`
+
+## Related
+
+- [Coordinator Reference](/api/cli/coordinator)
+- [TUI Reference](/api/cli/tui)
+- [CLI Overview](/api/cli/overview)

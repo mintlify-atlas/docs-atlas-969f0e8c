@@ -1,0 +1,642 @@
+---
+title: Loader Functions
+description: Data loader APIs for all modalities
+---
+
+MX8 provides specialized loaders optimized for different data types. All loaders share a common interface and support distributed training, checkpointing, and automatic memory management.
+
+## mx8.load
+
+Core byte loader for raw data streams.
+
+```python
+loader = mx8.load(
+    dataset_link,
+    batch_size_samples=64,
+    max_ram_gb=12,
+    profile="balanced",
+)
+```
+
+### Parameters
+
+<ParamField path="dataset_link" type="str" required>
+  Dataset path or S3 prefix. Supports:
+  - `s3://bucket/prefix/` - Load from S3
+  - `/local/path/` - Load from local filesystem
+  - `@refresh` suffix - Force fresh snapshot (e.g., `s3://bucket/data@refresh`)
+  - `@sha256:<hash>` suffix - Pin exact snapshot (e.g., `s3://bucket/data@sha256:abc123...`)
+</ParamField>
+
+<ParamField path="batch_size_samples" type="int" required>
+  Number of samples per batch.
+</ParamField>
+
+<ParamField path="max_ram_gb" type="float" default="None">
+  Memory budget in GB. MX8 derives inflight caps and queue sizes from this value based on the selected profile. Recommended way to control memory usage.
+</ParamField>
+
+<ParamField path="profile" type="str" default="balanced">
+  Safety/throughput preset:
+  - `"safe"` - Conservative memory, lower throughput
+  - `"balanced"` - Default balanced profile
+  - `"throughput"` - Aggressive prefetch for max speed
+</ParamField>
+
+<ParamField path="manifest_store" type="str" default="~/.mx8/manifests">
+  Local directory for manifest cache.
+</ParamField>
+
+<ParamField path="manifest_path" type="str" default="None">
+  Path to local manifest TSV for development/override flows.
+</ParamField>
+
+<ParamField path="recursive" type="bool" default="True">
+  Index subdirectories recursively.
+</ParamField>
+
+<ParamField path="start_id" type="int" default="None">
+  Start sample ID for range loading. Must be set with `end_id`.
+</ParamField>
+
+<ParamField path="end_id" type="int" default="None">
+  End sample ID (exclusive) for range loading. Must be set with `start_id`.
+</ParamField>
+
+<ParamField path="job_id" type="str" default="None">
+  Job identifier for distributed mode. Required when using distributed attach.
+</ParamField>
+
+<ParamField path="cluster_url" type="str" default="None">
+  Coordinator URL for distributed mode. Falls back to `MX8_CLUSTER_URL` or `MX8_COORD_URL` environment variable.
+</ParamField>
+
+<ParamField path="resume_from" type="bytes" default="None">
+  Opaque checkpoint token from `loader.checkpoint()`. Resumes from saved position.
+</ParamField>
+
+<ParamField path="node_id" type="str" default="None">
+  Node identity for proof logs and coordinator hints. Defaults to `rank{RANK}` in distributed mode.
+</ParamField>
+
+<ParamField path="autopack" type="bool" default="False">
+  Automatically pack unpacked S3 prefixes on first run.
+</ParamField>
+
+<ParamField path="autopack_shard_mb" type="int" default="512">
+  Shard size in MB when autopacking.
+</ParamField>
+
+<ParamField path="autotune" type="bool" default="True">
+  Enable runtime adaptation loop. Set to `False` for manual control.
+</ParamField>
+
+<ParamField path="constraints" type="mx8.Constraints" default="None">
+  Override specific cap values while keeping autotune active.
+</ParamField>
+
+<ParamField path="runtime" type="mx8.RuntimeConfig" default="None">
+  Explicit startup values when `autotune=False`.
+</ParamField>
+
+### Returns
+
+<ResponseField name="loader" type="mx8.ByteLoader">
+  Iterator yielding batches with:
+  - `sample_ids` (List[int]) - Sample identifiers
+  - `payload` (bytes) - Concatenated sample bytes
+  - `offsets` (List[int]) - Byte offsets into payload
+  - `label_ids` (List[int]) - Label IDs when available
+  - `to_torch()` - Convert to PyTorch tensors `(payload_u8, offsets_i64, sample_ids_i64)`
+  - `to_torch_with_labels()` - Include labels tensor
+</ResponseField>
+
+### Example
+
+```python
+import mx8
+
+loader = mx8.load(
+    "s3://bucket/dataset/",
+    batch_size_samples=64,
+    max_ram_gb=12,
+    profile="balanced",
+)
+
+for batch in loader:
+    sample_ids = batch.sample_ids
+    payload = batch.payload
+    offsets = batch.offsets
+    
+    # Or get PyTorch tensors
+    payload_u8, offsets_i64, sample_ids_i64 = batch.to_torch()
+```
+
+---
+
+## mx8.text
+
+Text loader with built-in tokenization.
+
+```python
+loader = mx8.text(
+    dataset_link,
+    tokenizer="gpt2",
+    sequence_length=2048,
+    stride=2048,
+    batch_size_samples=32,
+    max_ram_gb=12,
+)
+```
+
+### Parameters
+
+<ParamField path="dataset_link" type="str" required>
+  Dataset path or S3 prefix (same as `mx8.load`).
+</ParamField>
+
+<ParamField path="tokenizer" type="str" required>
+  Tokenizer reference. Supports:
+  - `"gpt2"` - Built-in GPT-2 tokenizer
+  - `/path/to/tokenizer.json` - Local tokenizer.json file
+</ParamField>
+
+<ParamField path="sequence_length" type="int" required>
+  Fixed output token length per row.
+</ParamField>
+
+<ParamField path="stride" type="int" required>
+  Step size for chunking long sequences. Use `stride < sequence_length` for overlap.
+</ParamField>
+
+<ParamField path="batch_size_samples" type="int" required>
+  Number of sequences per batch.
+</ParamField>
+
+<ParamField path="max_ram_gb" type="float" default="None">
+  Memory budget in GB.
+</ParamField>
+
+<ParamField path="add_bos" type="bool" default="False">
+  Prepend BOS token when available in tokenizer.
+</ParamField>
+
+<ParamField path="add_eos" type="bool" default="True">
+  Append EOS token when available in tokenizer.
+</ParamField>
+
+<ParamField path="truncate" type="str" default="right">
+  Long sequence handling: `"right"` or `"error"`.
+</ParamField>
+
+<ParamField path="return_attention_mask" type="bool" default="False">
+  Emit `batch.attention_mask` field.
+</ParamField>
+
+<ParamField path="decode_error_policy" type="str" default="error">
+  UTF-8 decode error handling: `"error"` or `"skip"`.
+</ParamField>
+
+<ParamField path="profile" type="str" default="balanced">
+  Memory/throughput profile.
+</ParamField>
+
+### Returns
+
+<ResponseField name="loader" type="mx8.TextLoader">
+  Iterator yielding batches with:
+  - `token_ids` (torch.Tensor[B, sequence_length]) - Token IDs as int64
+  - `attention_mask` (torch.Tensor[B, sequence_length]) - Attention mask as bool (when `return_attention_mask=True`)
+  - `sample_ids` (torch.Tensor[B]) - Sample IDs as int64
+</ResponseField>
+
+### Example
+
+```python
+import mx8
+
+loader = mx8.text(
+    "s3://bucket/corpus@refresh",
+    tokenizer="gpt2",
+    sequence_length=2048,
+    stride=2048,
+    add_eos=True,
+    batch_size_samples=32,
+    max_ram_gb=12,
+)
+
+for batch in loader:
+    token_ids = batch.token_ids  # [32, 2048] int64
+    train_step(token_ids)
+```
+
+---
+
+## mx8.image
+
+Image loader with decode, resize, and augmentation.
+
+```python
+loader = mx8.image(
+    dataset_link,
+    batch_size_samples=64,
+    max_ram_gb=12,
+    resize_hw=(224, 224),
+    augment="imagenet",
+    seed=42,
+)
+```
+
+### Parameters
+
+<ParamField path="dataset_link" type="str" required>
+  Dataset path or S3 prefix.
+</ParamField>
+
+<ParamField path="batch_size_samples" type="int" required>
+  Number of images per batch.
+</ParamField>
+
+<ParamField path="max_ram_gb" type="float" default="None">
+  Memory budget in GB.
+</ParamField>
+
+<ParamField path="resize_hw" type="tuple[int, int]" default="None">
+  `(height, width)` to resize images. If not set, images use original size. All images in a batch must have the same dimensions.
+</ParamField>
+
+<ParamField path="augment" type="str" default="None">
+  Augmentation preset:
+  - `"imagenet"` or `"standard"` - ImageNet training preset (resize 256x256, crop 224x224, flip, jitter, normalize)
+  - `None` - No augmentation
+</ParamField>
+
+<ParamField path="crop_hw" type="tuple[int, int]" default="None">
+  `(height, width)` for random crop after resize.
+</ParamField>
+
+<ParamField path="horizontal_flip_p" type="float" default="0.0">
+  Horizontal flip probability in `[0, 1]`.
+</ParamField>
+
+<ParamField path="color_jitter_brightness" type="float" default="0.0">
+  Brightness jitter magnitude (non-negative).
+</ParamField>
+
+<ParamField path="color_jitter_contrast" type="float" default="0.0">
+  Contrast jitter magnitude (non-negative).
+</ParamField>
+
+<ParamField path="color_jitter_saturation" type="float" default="0.0">
+  Saturation jitter magnitude (non-negative).
+</ParamField>
+
+<ParamField path="normalize_mean" type="tuple[float, float, float]" default="None">
+  Per-channel normalization mean. Must be set with `normalize_std`.
+</ParamField>
+
+<ParamField path="normalize_std" type="tuple[float, float, float]" default="None">
+  Per-channel normalization std (must be > 0). Must be set with `normalize_mean`.
+</ParamField>
+
+<ParamField path="seed" type="int" default="None">
+  Random seed for deterministic augmentation.
+</ParamField>
+
+<ParamField path="epoch" type="int" default="None">
+  Epoch number for deterministic augmentation.
+</ParamField>
+
+<ParamField path="to_float" type="bool" default="True">
+  Normalize pixels to float32 in `[0, 1]`. Set `False` for uint8 output.
+</ParamField>
+
+<ParamField path="profile" type="str" default="balanced">
+  Memory/throughput profile.
+</ParamField>
+
+### Returns
+
+<ResponseField name="loader" type="mx8.ImageLoader">
+  Iterator yielding `(images, labels)` tuples:
+  - `images` (torch.Tensor[B, C, H, W]) - Images as float32 (or uint8 if `to_float=False`)
+  - `labels` (torch.Tensor[B]) - Label IDs as int64
+  
+  Loader also exposes:
+  - `loader.classes` - List of class names (or `None`)
+</ResponseField>
+
+### Example
+
+```python
+import mx8
+
+# ImageNet preset
+loader = mx8.image(
+    "s3://bucket/imagenet/train/@refresh",
+    augment="imagenet",
+    batch_size_samples=64,
+    max_ram_gb=12,
+    seed=42,
+    epoch=0,
+)
+
+print(loader.classes)  # ["cat", "dog", ...]
+
+for images, labels in loader:
+    # images: [64, 3, 224, 224] float32
+    # labels: [64] int64
+    train_step(images, labels)
+
+# Custom augmentation
+loader = mx8.image(
+    "s3://bucket/data/",
+    batch_size_samples=32,
+    max_ram_gb=8,
+    resize_hw=(256, 256),
+    crop_hw=(224, 224),
+    horizontal_flip_p=0.5,
+    color_jitter_brightness=0.2,
+    color_jitter_contrast=0.2,
+    normalize_mean=(0.485, 0.456, 0.406),
+    normalize_std=(0.229, 0.224, 0.225),
+    seed=17,
+    epoch=1,
+)
+```
+
+---
+
+## mx8.audio
+
+Audio loader with decode and resampling.
+
+```python
+loader = mx8.audio(
+    dataset_link,
+    batch_size_samples=32,
+    sample_count=16000,
+    channels=1,
+    sample_rate_hz=16000,
+    max_ram_gb=12,
+)
+```
+
+### Parameters
+
+<ParamField path="dataset_link" type="str" required>
+  Dataset path or S3 prefix.
+</ParamField>
+
+<ParamField path="batch_size_samples" type="int" required>
+  Number of audio samples per batch.
+</ParamField>
+
+<ParamField path="sample_count" type="int" required>
+  Fixed output frame count per row. Short clips are zero-padded; long clips are truncated.
+</ParamField>
+
+<ParamField path="channels" type="int" default="1">
+  Output channels. Currently only `channels=1` (mono) is supported in `mx8==1.0.5`.
+</ParamField>
+
+<ParamField path="sample_rate_hz" type="int" default="None">
+  Strict sample rate check. Samples with mismatched rates follow `decode_error_policy`.
+</ParamField>
+
+<ParamField path="decode_error_policy" type="str" default="error">
+  Decode failure handling: `"error"` or `"skip"`.
+</ParamField>
+
+<ParamField path="max_ram_gb" type="float" default="None">
+  Memory budget in GB.
+</ParamField>
+
+<ParamField path="profile" type="str" default="balanced">
+  Memory/throughput profile.
+</ParamField>
+
+### Returns
+
+<ResponseField name="loader" type="mx8.AudioLoader">
+  Iterator yielding batches with:
+  - `samples` (torch.Tensor[B, sample_count]) - Audio samples as float32
+  - `sample_rates_hz` (torch.Tensor[B]) - Sample rates as int64
+  - `sample_ids` (torch.Tensor[B]) - Sample IDs as int64
+</ResponseField>
+
+### Example
+
+```python
+import mx8
+
+loader = mx8.audio(
+    "s3://bucket/audio@refresh",
+    batch_size_samples=32,
+    sample_count=16000,
+    channels=1,
+    sample_rate_hz=16000,
+    max_ram_gb=12,
+)
+
+for batch in loader:
+    samples = batch.samples  # [32, 16000] float32
+    sample_rates = batch.sample_rates_hz  # [32] int64
+    sample_ids = batch.sample_ids  # [32] int64
+    
+    train_step(samples)
+```
+
+<Note>
+  Supported formats in `mx8==1.0.5`: WAV and FLAC.
+</Note>
+
+---
+
+## mx8.video
+
+Video loader with clip extraction.
+
+```python
+loader = mx8.video(
+    dataset_link,
+    clip_len=16,
+    stride=8,
+    fps=8,
+    batch_size_samples=32,
+    max_ram_gb=12,
+)
+```
+
+### Parameters
+
+<ParamField path="dataset_link" type="str" required>
+  Dataset path or S3 prefix.
+</ParamField>
+
+<ParamField path="clip_len" type="int" required>
+  Number of frames per clip.
+</ParamField>
+
+<ParamField path="stride" type="int" required>
+  Frame stride for clip extraction.
+</ParamField>
+
+<ParamField path="fps" type="int" required>
+  Target frames per second.
+</ParamField>
+
+<ParamField path="batch_size_samples" type="int" required>
+  Number of clips per batch.
+</ParamField>
+
+<ParamField path="max_ram_gb" type="float" default="None">
+  Memory budget in GB.
+</ParamField>
+
+<ParamField path="profile" type="str" default="balanced">
+  Memory/throughput profile.
+</ParamField>
+
+<ParamField path="autotune" type="bool" default="True">
+  Enable runtime autotune.
+</ParamField>
+
+<ParamField path="constraints" type="mx8.Constraints" default="None">
+  Runtime constraints for caps.
+</ParamField>
+
+### Returns
+
+<ResponseField name="loader" type="mx8.VideoLoader">
+  Iterator yielding batches with:
+  - `clip_ids` (List[int]) - Clip identifiers
+  - `sample_ids` (List[int]) - Sample identifiers
+  - `media_uris` (List[str]) - Source media URIs
+  - `clip_starts` (List[int]) - Clip start positions
+  - `payload` (bytes) - Concatenated clip bytes
+  - `offsets` (List[int]) - Byte offsets
+  
+  Batch metadata:
+  - `frames_per_clip` (int)
+  - `frame_height` (int)
+  - `frame_width` (int)
+  - `channels` (int)
+  - `layout` (str) - "thwc"
+  - `dtype` (str) - "u8"
+  - `colorspace` (str) - "rgb24"
+  - `strides` (List[int])
+</ResponseField>
+
+### Example
+
+```python
+import mx8
+
+loader = mx8.video(
+    "s3://bucket/videos/",
+    clip_len=16,
+    stride=8,
+    fps=8,
+    batch_size_samples=32,
+    max_ram_gb=12,
+)
+
+for batch in loader:
+    clip_ids = batch.clip_ids
+    payload = batch.payload
+    offsets = batch.offsets
+    
+    # Metadata
+    frames = batch.frames_per_clip
+    height = batch.frame_height
+    width = batch.frame_width
+```
+
+<Note>
+  Default decode backend uses local `ffmpeg` CLI. Override with `MX8_FFMPEG_BIN` environment variable.
+</Note>
+
+---
+
+## mx8.mix
+
+Blend multiple loaders with weighted sampling.
+
+```python
+mixed = mx8.mix(
+    [loader_a, loader_b],
+    weights=[0.7, 0.3],
+    seed=17,
+    epoch=0,
+    max_ram_gb=12,
+)
+```
+
+### Parameters
+
+<ParamField path="loaders" type="list" required>
+  List of source loaders (created with `mx8.load()` or `mx8.DistributedDataLoader()`).
+</ParamField>
+
+<ParamField path="weights" type="list[float]" required>
+  Positive weights for each loader (normalized internally).
+</ParamField>
+
+<ParamField path="seed" type="int" required>
+  Random seed for deterministic scheduling.
+</ParamField>
+
+<ParamField path="epoch" type="int" required>
+  Epoch number for deterministic scheduling.
+</ParamField>
+
+<ParamField path="source_exhausted" type="str" default="error">
+  Behavior when a source runs out:
+  - `"error"` - Fail fast (default)
+  - `"allow"` - Continue draining remaining sources
+</ParamField>
+
+<ParamField path="max_ram_gb" type="float" default="None">
+  Shared memory budget across all sources.
+</ParamField>
+
+<ParamField path="profile" type="str" default="balanced">
+  Memory/throughput profile.
+</ParamField>
+
+<ParamField path="starvation_window" type="int" default="None">
+  Scheduler starvation accounting window.
+</ParamField>
+
+### Returns
+
+<ResponseField name="mixed" type="mx8.MixLoader">
+  Iterator yielding batches from weighted blend of sources.
+</ResponseField>
+
+### Example
+
+```python
+import mx8
+
+loader_a = mx8.load("s3://bucket/dataset_a/", batch_size_samples=32, max_ram_gb=6)
+loader_b = mx8.load("s3://bucket/dataset_b/", batch_size_samples=32, max_ram_gb=6)
+
+mixed = mx8.mix(
+    [loader_a, loader_b],
+    weights=[0.7, 0.3],
+    seed=17,
+    epoch=3,
+    source_exhausted="error",
+    max_ram_gb=12,
+    profile="balanced",
+)
+
+for batch in mixed:
+    train_step(batch)
+```
+
+<Note>
+  For fixed manifests, weights, seed, and epoch, the mixed stream order is deterministic and replayable.
+</Note>

@@ -1,0 +1,230 @@
+---
+title: Dataset Packing
+description: Pack datasets into tar shards with precomputed manifests for production-scale loading
+---
+
+Before loading datasets at production scale, pack them once to create a precomputed manifest. The packer writes tar shards and a manifest TSV that MX8 uses for all subsequent runs.
+
+## Why Pack?
+
+Packing provides:
+
+- **Fast startup**: No need to list/index thousands of files at job start
+- **Snapshot consistency**: Manifest captures dataset state at a point in time
+- **Efficient storage**: Tar shards reduce S3 API overhead
+- **Deterministic ordering**: Sample IDs are assigned during packing
+
+## Packing from S3
+
+Use `mx8.pack()` to pack an S3 prefix:
+
+```python
+import mx8
+
+mx8.pack(
+    "s3://bucket/raw-images/",
+    out="s3://bucket/packed-images/",
+    shard_mb=512,
+    label_mode="auto",
+)
+```
+
+### Parameters
+
+- `pack_in`: Source S3 prefix containing raw files
+- `out`: Destination S3 prefix for tar shards and manifest
+- `shard_mb`: Size of each tar shard in MB (default `512`)
+- `label_mode`: Label extraction strategy - `auto`, `none`, or `imagefolder`
+- `require_labels`: Fail if labels expected but not found (default `False`)
+- `parallel_fetches`: Concurrent S3 GET requests during packing (default `128`)
+
+<Note>
+Override `parallel_fetches` with `MX8_PACK_PARALLEL_FETCHES` env var. Part size for multipart upload defaults to 16MB and is tunable via `MX8_PACK_PART_MB`.
+</Note>
+
+### ImageFolder Label Mode
+
+When `label_mode="imagefolder"`, the packer expects this structure:
+
+```
+s3://bucket/raw-images/
+  cat/
+    img001.jpg
+    img002.jpg
+  dog/
+    img003.jpg
+    img004.jpg
+```
+
+The directory name becomes the label. Labels are assigned consecutive integer IDs.
+
+## Packing from Local Filesystem
+
+Use `mx8.pack_dir()` for local directories:
+
+```python
+import mx8
+
+mx8.pack_dir(
+    "/data/raw-images/",
+    out="s3://bucket/packed-images/",
+    shard_mb=512,
+    label_mode="imagefolder",
+)
+```
+
+Parameters are identical to `mx8.pack()`, except `in_dir` points to a local path.
+
+## Packing Workflow
+
+<Steps>
+  <Step title="Run the packer once">
+    ```python
+    import mx8
+
+    mx8.pack(
+        "s3://bucket/raw-images/",
+        out="s3://bucket/packed-images/",
+        shard_mb=512,
+        label_mode="imagefolder",
+    )
+    ```
+
+    The packer writes:
+    - `shard_00000.tar`, `shard_00001.tar`, ... (tar shards)
+    - `manifest.tsv` (sample ID → shard mapping)
+  </Step>
+
+  <Step title="Load from the packed dataset">
+    ```python
+    import mx8
+
+    loader = mx8.image(
+        "s3://bucket/packed-images/@refresh",
+        batch_size_samples=64,
+        max_ram_gb=12,
+    )
+
+    for images, labels in loader:
+        # images: [B, C, H, W] float32
+        # labels: [B] int64
+        pass
+    ```
+
+    MX8 reads the manifest and streams from tar shards. No additional packing needed.
+  </Step>
+
+  <Step title="Pin the snapshot for consistency">
+    ```python
+    import mx8
+
+    # Resolve manifest hash once
+    manifest_hash = mx8.resolve_manifest_hash("s3://bucket/packed-images/@refresh")
+    pinned = f"s3://bucket/packed-images/@sha256:{manifest_hash}"
+
+    # Use pinned link for all epochs
+    loader = mx8.image(pinned, batch_size_samples=64, max_ram_gb=12)
+    ```
+
+    This ensures every epoch sees the exact same dataset snapshot.
+  </Step>
+</Steps>
+
+## Resolving Manifest Hashes
+
+Use `mx8.resolve_manifest_hash()` to get the pinned manifest hash without starting a loader:
+
+```python
+import mx8
+
+manifest_hash = mx8.resolve_manifest_hash(
+    "s3://bucket/packed-images/@refresh",
+    manifest_store="~/.mx8/manifests",
+    recursive=True,
+)
+
+print(f"Pinned dataset: s3://bucket/packed-images/@sha256:{manifest_hash}")
+```
+
+### Parameters
+
+- `dataset_link`: Dataset path with optional `@refresh` or `@sha256:<hash>` suffix
+- `manifest_store`: Manifest store root (default `~/.mx8/manifests`)
+- `manifest_path`: Optional local manifest TSV for override flows
+- `recursive`: Index subdirectories (default `True`)
+- `node_id`: Node identity for lock ownership during snapshot resolution
+
+## Autopacking
+
+For development workflows, enable `autopack` to pack on first load:
+
+```python
+import mx8
+
+loader = mx8.load(
+    "s3://bucket/raw-images/",
+    batch_size_samples=64,
+    max_ram_gb=12,
+    autopack=True,
+    autopack_shard_mb=512,
+)
+```
+
+The first run packs the dataset in-place. Subsequent runs skip packing automatically.
+
+<Warning>
+`autopack` is convenient for prototyping but not recommended for production. Pack datasets explicitly with `mx8.pack()` before launching production jobs.
+</Warning>
+
+## Packing Best Practices
+
+<AccordionGroup>
+  <Accordion title="Shard Size">
+    Default `shard_mb=512` works well for most use cases. Increase for very large files (video, high-res images) to reduce shard count. Decrease for small files to improve load balancing.
+  </Accordion>
+
+  <Accordion title="Parallel Fetches">
+    Default `parallel_fetches=128` is tuned for S3. Increase on high-bandwidth connections. Decrease if you hit S3 rate limits.
+  </Accordion>
+
+  <Accordion title="Label Modes">
+    - Use `label_mode="imagefolder"` for classification datasets with directory-based labels
+    - Use `label_mode="none"` for unlabeled data (embeddings, inference)
+    - Use `label_mode="auto"` to auto-detect based on directory structure
+  </Accordion>
+
+  <Accordion title="Repacking">
+    If the source dataset changes, repack and use a new pinned hash. MX8 does not auto-detect source changes after packing.
+  </Accordion>
+</AccordionGroup>
+
+## Example: Multi-Epoch Training with Pinned Snapshot
+
+```python
+import mx8
+
+# Pack once (or use existing packed dataset)
+mx8.pack(
+    "s3://bucket/train-raw/",
+    out="s3://bucket/train-packed/",
+    shard_mb=512,
+    label_mode="imagefolder",
+)
+
+# Resolve manifest hash once before training
+manifest_hash = mx8.resolve_manifest_hash("s3://bucket/train-packed/@refresh")
+pinned = f"s3://bucket/train-packed/@sha256:{manifest_hash}"
+
+# Train for multiple epochs with consistent snapshot
+for epoch in range(10):
+    loader = mx8.image(
+        pinned,
+        batch_size_samples=64,
+        max_ram_gb=12,
+        profile="balanced",
+    )
+    for batch in loader:
+        train_step(batch)
+```
+
+This ensures every epoch sees the exact same samples in the same order (when `seed` and `epoch` are consistent).

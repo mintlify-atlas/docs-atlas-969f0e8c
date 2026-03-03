@@ -1,80 +1,368 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quickstart
+description: Get your first MX8 loader running in 2 minutes
 ---
 
-## Get started in three steps
+# Quickstart
 
-Get your documentation site running locally and make your first customization.
+This guide gets you from zero to a working MX8 loader in under 2 minutes.
 
-### Step 1: Set up your local environment
+## Prerequisites
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+- Python 3.8 or higher
+- pip installed
 
-### Step 2: Deploy your changes
+## Install MX8
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+<Steps>
+  <Step title="Install the package">
+    ```bash
+    pip install mx8
+    ```
+  </Step>
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+  <Step title="Verify installation">
+    ```bash
+    python -c "import mx8; print(mx8.__version__)"
+    ```
+  </Step>
+</Steps>
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+## Your First Loader
 
-### Step 3: Go live
+Create a file called `first_loader.py`:
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+```python
+import mx8
 
-## Next steps
+loader = mx8.load(
+    "s3://your-bucket/dataset/",
+    batch_size_samples=64,
+    max_ram_gb=12,
+    profile="balanced",
+)
 
-Now that you have your docs running, explore these key features:
+print("manifest_hash:", loader.manifest_hash)
 
-<CardGroup cols={2}>
+total = 0
+for batch in loader:
+    total += len(batch.sample_ids)
+    print(f"Delivered {total} samples so far")
 
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
-</CardGroup>
+print(f"Total samples: {total}")
+```
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+  Replace `s3://your-bucket/dataset/` with your actual S3 path or local directory.
 </Note>
+
+Run it:
+
+```bash
+python first_loader.py
+```
+
+## What Just Happened?
+
+MX8 automatically:
+
+1. **Indexed your dataset** - Scanned the S3 prefix and created a manifest
+2. **Computed a snapshot hash** - Pinned the dataset state for deterministic replay
+3. **Enforced memory bounds** - Limited pipeline memory to 12GB
+4. **Delivered batches** - Fetched, decoded, and packed samples with bounded queues
+
+The manifest is cached at `~/.mx8/manifests/` for future runs.
+
+## Training Example
+
+Here's a minimal training loop using PyTorch:
+
+```python
+import mx8
+import torch
+import torch.nn.functional as F
+
+loader = mx8.load(
+    "s3://your-bucket/dataset/",
+    batch_size_samples=32,
+    max_ram_gb=4,
+    profile="balanced",
+)
+
+model = torch.nn.Linear(1024, 10)  # example model
+opt = torch.optim.SGD(model.parameters(), lr=0.01)
+
+for batch in loader:
+    payload_u8, offsets_i64, sample_ids_i64 = batch.to_torch()
+    
+    # Your training logic here
+    # This example assumes fixed-size samples of 1024 bytes
+    x = payload_u8.reshape(-1, 1024).float() / 255.0
+    y = (sample_ids_i64 % 10)  # dummy labels
+    
+    pred = model(x)
+    loss = F.cross_entropy(pred, y)
+    
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+    
+    print(f"Loss: {loss.item():.4f}")
+```
+
+<Warning>
+  This example assumes all samples are exactly 1024 bytes. For variable-length data, use `offsets` to extract individual samples.
+</Warning>
+
+## Image Training Example
+
+For image datasets, use the `mx8.image` loader:
+
+```python
+import mx8
+import torch
+import torch.nn.functional as F
+
+loader = mx8.image(
+    "s3://your-bucket/images/",
+    batch_size_samples=64,
+    resize_hw=(224, 224),
+    augment="imagenet",  # automatic augmentation + normalization
+    max_ram_gb=8,
+    profile="balanced",
+)
+
+print("Classes:", loader.classes)  # ['cat', 'dog', ...] or None
+
+model = torch.nn.Sequential(
+    torch.nn.Flatten(),
+    torch.nn.Linear(224 * 224 * 3, 10)
+)
+opt = torch.optim.SGD(model.parameters(), lr=0.01)
+
+for images, labels in loader:
+    # images: [B, C, H, W] float32 tensor
+    # labels: [B] int64 tensor
+    
+    logits = model(images)
+    loss = F.cross_entropy(logits, labels)
+    
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+    
+    print(f"Loss: {loss.item():.4f}")
+```
+
+## Multi-Epoch Training
+
+Loaders are single-pass. For multi-epoch training, create a new loader each epoch:
+
+```python
+import mx8
+
+# Pin the snapshot once
+manifest_hash = mx8.resolve_manifest_hash("s3://bucket/train@refresh")
+pinned = f"s3://bucket/train@sha256:{manifest_hash}"
+
+for epoch in range(10):
+    loader = mx8.load(
+        pinned,
+        batch_size_samples=64,
+        max_ram_gb=8,
+        profile="balanced",
+    )
+    
+    for batch in loader:
+        train_step(batch)
+    
+    print(f"Epoch {epoch} complete")
+```
+
+<Note>
+  Pinning the manifest hash ensures every epoch sees the exact same dataset snapshot.
+</Note>
+
+## Monitoring Pipeline Health
+
+Check loader stats to monitor throughput and memory:
+
+```python
+import mx8
+
+loader = mx8.load("s3://bucket/dataset/", max_ram_gb=12)
+
+for batch in loader:
+    train_step(batch)
+    
+    # Print human-readable stats
+    if batch_num % 100 == 0:
+        print(mx8.stats(loader))
+    
+    # Or access raw metrics
+    stats = loader.stats()
+    if stats["ram_high_water_bytes"] > 10 * 1024**3:  # 10GB
+        print("Warning: approaching memory limit")
+```
+
+Key stats fields:
+- `delivered_samples_total` - Total samples delivered so far
+- `process_rss_bytes` - Current process memory usage
+- `ram_high_water_bytes` - Peak pipeline memory usage
+- `elapsed_seconds` - Time since loader start
+
+## Distributed Training
+
+For multi-node training, use the coordinator context manager:
+
+```python
+import os
+import mx8
+
+rank = int(os.environ["RANK"])
+world_size = int(os.environ["WORLD_SIZE"])
+
+# Start coordinator on rank 0, all ranks wait automatically
+with mx8.coordinator(rank=rank, world_size=world_size) as coord:
+    loader = mx8.load(
+        "s3://bucket/train/",
+        batch_size_samples=512,
+        max_ram_gb=24,
+        job_id="train-001",
+        cluster_url=coord.url,
+    )
+    
+    for batch in loader:
+        train_step(batch)
+```
+
+Launch with torchrun:
+
+```bash
+torchrun --nproc_per_node=8 train.py
+```
+
+## Next Steps
+
+Now that you have a working loader:
+
+<CardGroup cols={2}>
+  <Card title="Explore the API" icon="book" href="/api/python/overview">
+    Learn about text, audio, video, and mix loaders
+  </Card>
+  
+  <Card title="Understand Architecture" icon="sitemap" href="/concepts/architecture">
+    Deep dive into bounded memory and lease recovery
+  </Card>
+  
+  <Card title="Production Deployment" icon="server" href="/guides/deployment">
+    Deploy coordinators and agents for production workloads
+  </Card>
+  
+  <Card title="Memory Contracts" icon="shield" href="/concepts/memory-contract">
+    Learn how MX8 enforces memory guarantees
+  </Card>
+</CardGroup>
+
+## Common Patterns
+
+### Pattern: Checkpoint and Resume
+
+```python
+loader = mx8.load("s3://bucket/dataset/", max_ram_gb=12)
+
+for batch in loader:
+    train_step(batch)
+    
+    if should_checkpoint():
+        token = loader.checkpoint()
+        save_checkpoint(model, token)
+
+# Resume from checkpoint
+loader = mx8.load(
+    "s3://bucket/dataset/",
+    max_ram_gb=12,
+    resume_from=token,
+)
+```
+
+### Pattern: Specific Sample Range
+
+```python
+# Load only samples 1000-2000
+loader = mx8.load(
+    "s3://bucket/dataset/",
+    start_id=1000,
+    end_id=2000,
+    batch_size_samples=64,
+    max_ram_gb=8,
+)
+```
+
+### Pattern: Auto-packing on First Run
+
+```python
+# Automatically pack a raw S3 prefix on first run
+loader = mx8.load(
+    "s3://bucket/raw-images/",
+    autopack=True,
+    autopack_shard_mb=512,
+    max_ram_gb=12,
+)
+```
+
+The packed manifest and shards are written to the same prefix. Subsequent runs skip packing automatically.
+
+## Troubleshooting
+
+### Error: "max_ram_gb cap would be breached"
+
+Increase `max_ram_gb` or reduce `batch_size_samples`:
+
+```python
+loader = mx8.load(
+    "s3://bucket/dataset/",
+    batch_size_samples=32,  # reduced from 64
+    max_ram_gb=16,          # increased from 12
+)
+```
+
+### Error: "manifest not found"
+
+For local development, provide an explicit manifest path:
+
+```python
+loader = mx8.load(
+    "/tmp/dev@refresh",
+    manifest_path="/path/to/manifest.tsv",
+    max_ram_gb=8,
+)
+```
+
+### Performance: Slow throughput
+
+Try the `throughput` profile:
+
+```python
+loader = mx8.load(
+    "s3://bucket/dataset/",
+    max_ram_gb=24,
+    profile="throughput",  # less conservative than "balanced"
+)
+```
+
+Or disable autotune and set explicit runtime config:
+
+```python
+runtime = mx8.RuntimeConfig(
+    prefetch_batches=8,
+    max_queue_batches=16,
+)
+
+loader = mx8.load(
+    "s3://bucket/dataset/",
+    max_ram_gb=24,
+    autotune=False,
+    runtime=runtime,
+)
+```

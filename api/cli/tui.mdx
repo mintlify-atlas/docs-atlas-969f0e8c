@@ -1,0 +1,335 @@
+---
+title: mx8-tui
+description: Terminal UI for monitoring MX8 distributed data pipeline jobs
+---
+
+The `mx8-tui` binary is a read-only terminal interface that provides operators with a live view of running MX8 jobs. It displays coordinator state, per-node runtime stats, lease information, and a browsable manifest explorer.
+
+## Usage
+
+```bash
+mx8-tui [OPTIONS]
+```
+
+All arguments can be provided via CLI flags or environment variables.
+
+## Core Configuration
+
+| Flag | Environment Variable | Default | Description |
+|------|---------------------|---------|-------------|
+| `--coord-url` | `MX8_COORD_URL` | `http://127.0.0.1:50051` | Coordinator address |
+| `--job-id` | `MX8_JOB_ID` | `local-job` | Job to inspect |
+| `--grpc-max-message-bytes` | `MX8_GRPC_MAX_MESSAGE_BYTES` | `67108864` | gRPC message size cap (must match coordinator) |
+
+## Display Options
+
+| Flag | Environment Variable | Default | Description |
+|------|---------------------|---------|-------------|
+| `--poll-ms` | `MX8_TUI_POLL_MS` | `1000` | Polling interval for state refresh |
+| `--rows-per-page` | `MX8_TUI_ROWS_PER_PAGE` | `12` | Manifest rows per page |
+
+## Manifest Explorer
+
+| Flag | Environment Variable | Default | Description |
+|------|---------------------|---------|-------------|
+| `--manifest-hash` | `MX8_TUI_MANIFEST_HASH` | unset | Optional initial manifest hash |
+| `--search` | `MX8_TUI_SEARCH` | `""` | Initial search filter for manifest panel |
+| `--manifest-path` | `MX8_TUI_MANIFEST_PATH` | unset | Local TSV fallback when coordinator manifest unavailable |
+
+## Health Thresholds
+
+| Flag | Environment Variable | Default | Description |
+|------|---------------------|---------|-------------|
+| `--stale-heartbeat-ms` | `MX8_TUI_STALE_HEARTBEAT_MS` | `5000` | Heartbeat age threshold to mark node stale |
+| `--lease-stall-ms` | `MX8_TUI_LEASE_STALL_MS` | `10000` | No-progress threshold with active leases before marking job stalled |
+
+## Headless Mode
+
+| Flag | Environment Variable | Default | Description |
+|------|---------------------|---------|-------------|
+| `--headless-polls` | `MX8_TUI_HEADLESS_POLLS` | `0` | Poll count for headless mode (0 disables) |
+
+Headless mode polls a fixed number of times and exits non-zero if any panel never becomes non-empty. Useful in CI and gate scripts.
+
+## Panels Overview
+
+### Coordinator & Lease Panel
+
+Displays:
+- Job readiness and drain state
+- Registered node count
+- Active lease count
+- Available range count
+- Event counters (register, heartbeat, lease, progress)
+- Distributed resume counters (`resume_ok`, `resume_reject`, `resume_ranges`)
+- Cluster health signal (`healthy`, `degraded`, `stalled`)
+- Stale heartbeat count
+- Cluster-wide memory envelope totals
+
+### Runtime Panel
+
+Per-node information:
+- Heartbeat age and state
+- `inflight_bytes` with cap ratio
+- `ram_high_water_bytes` with cap ratio
+- Fetch, decode, and pack queue depths
+- Autotune fields (when available):
+  - `autotune_enabled`
+  - `effective_want`
+  - `effective_prefetch_batches`
+  - `effective_max_queue_batches`
+  - `autotune_pressure_milli`
+  - `autotune_cooldown_ticks`
+  - `batch_payload_p95_over_p50_milli`
+  - `batch_jitter_slo_breaches_total`
+
+Fields show as zero when heartbeat doesn't carry them.
+
+### Manifest Explorer
+
+Browsable view of manifest records:
+- Sample ID
+- Byte length
+- Location
+- Decode hint (if present)
+
+Supports search and filtering by location or decode hint.
+
+## Keybindings
+
+| Key | Action |
+|-----|--------|
+| `q` | Quit |
+| `j` / Down Arrow | Move to next row |
+| `k` / Up Arrow | Move to previous row |
+| `PgDn` | Page down |
+| `PgUp` | Page up |
+| `/` | Enter search mode |
+| `Enter` | Apply search filter |
+| `Esc` | Cancel search |
+| `g` | Enter jump-to-sample-id mode |
+
+### Search Mode
+
+1. Press `/` to enter search mode
+2. Type a filter string (searches location and decode hint)
+3. Press `Enter` to apply filter
+4. Press `Esc` to cancel
+
+### Jump to Sample ID
+
+1. Press `g` to enter jump mode
+2. Type a numeric sample ID
+3. Press `Enter` to jump to that sample
+4. Press `Esc` to cancel
+
+## Examples
+
+### Monitor a production job
+
+```bash
+mx8-tui \
+  --coord-url http://coordinator.prod.internal:50051 \
+  --job-id training-run-2024-03
+```
+
+### Fast polling for debugging
+
+```bash
+mx8-tui \
+  --coord-url http://127.0.0.1:50051 \
+  --job-id demo-job \
+  --poll-ms 200 \
+  --stale-heartbeat-ms 2000
+```
+
+### Headless mode for CI validation
+
+```bash
+mx8-tui \
+  --coord-url http://127.0.0.1:50051 \
+  --job-id gate-job \
+  --poll-ms 300 \
+  --headless-polls 6 \
+  --stale-heartbeat-ms 5000 \
+  --lease-stall-ms 10000
+```
+
+Exits with status:
+- `0`: All panels populated successfully
+- Non-zero: One or more panels never became non-empty
+
+### Pre-filtered manifest search
+
+```bash
+mx8-tui \
+  --coord-url http://coordinator:50051 \
+  --job-id prod-job \
+  --search "s3://bucket/shard-001"
+```
+
+### Local manifest fallback
+
+```bash
+mx8-tui \
+  --coord-url http://coordinator:50051 \
+  --job-id prod-job \
+  --manifest-path ./fallback-manifest.tsv
+```
+
+## Troubleshooting
+
+### Lease panel stays empty
+
+**Symptoms:** No leases or coordinator stats displayed
+
+**Causes:**
+- Coordinator not reachable at `--coord-url`
+- Incorrect `--job-id` (doesn't match active job)
+- Network connectivity issues
+
+**Resolution:**
+```bash
+# Test coordinator connectivity
+curl http://coordinator:50051
+
+# Verify job-id matches coordinator
+grep "job_id" coordinator.log
+```
+
+### Runtime panel stays empty
+
+**Symptoms:** No per-node stats displayed
+
+**Causes:**
+- No agents have registered yet
+- Agents not heartbeating
+- All agents departed or timed out
+
+**Resolution:**
+```bash
+# Check agent logs for heartbeat errors
+grep "heartbeat" agent.log
+
+# Verify agents registered with coordinator
+grep "register_node" coordinator.log
+```
+
+### Manifest panel stays empty
+
+**Symptoms:** No manifest records displayed
+
+**Causes:**
+- Manifest doesn't exist in coordinator's manifest store
+- Manifest hash mismatch
+- Manifest fetch failed
+
+**Resolution:**
+```bash
+# Use local fallback manifest
+mx8-tui \
+  --coord-url http://coordinator:50051 \
+  --job-id prod-job \
+  --manifest-path ./local-manifest.tsv
+
+# Verify manifest exists
+ls ~/.mx8/manifests/
+```
+
+### Cluster health shows "degraded"
+
+**Causes:**
+- One or more nodes have stale heartbeats
+- Lease progress stalled but work remaining
+- High memory pressure on nodes
+
+**Resolution:**
+1. Check runtime panel for nodes with old heartbeat ages
+2. Restart stale agents
+3. Review lease panel for stuck leases
+4. Check node memory caps vs usage
+
+### Cluster health shows "stalled"
+
+**Causes:**
+- Active leases but no progress for > `--lease-stall-ms`
+- All agents stopped processing
+- Deadlock in pipeline
+
+**Resolution:**
+1. Check coordinator logs for lease expiry events
+2. Review agent logs for errors
+3. Verify data source (S3/filesystem) is accessible
+4. Consider restarting job if recovery doesn't happen
+
+## Headless Mode for CI
+
+Use headless mode in gate scripts:
+
+```bash
+#!/bin/bash
+set -e
+
+# Start coordinator and agents
+# ...
+
+# Wait for job to initialize and verify health
+mx8-tui \
+  --coord-url http://127.0.0.1:50051 \
+  --job-id gate-job \
+  --poll-ms 300 \
+  --headless-polls 10 \
+  --stale-heartbeat-ms 5000
+
+if [ $? -eq 0 ]; then
+  echo "Job health check passed"
+else
+  echo "Job health check failed"
+  exit 1
+fi
+```
+
+Gate script: `./scripts/tui_gate.sh`
+
+Include in smoke suite:
+
+```bash
+MX8_SMOKE_TUI=1 ./scripts/smoke.sh
+```
+
+## Production Monitoring Workflow
+
+### Initial Job Launch
+
+1. Start coordinator and agents
+2. Launch TUI to verify registration:
+   ```bash
+   mx8-tui --coord-url http://coordinator:50051 --job-id prod-job
+   ```
+3. Wait for all nodes to appear in runtime panel
+4. Verify job_ready status in coordinator panel
+5. Monitor initial lease distribution
+
+### Ongoing Monitoring
+
+- Check heartbeat ages (should be < 2-3 seconds)
+- Monitor lease count (should stay roughly balanced)
+- Watch memory ratios (inflight_bytes, ram_high_water)
+- Track cluster health signal
+
+### Incident Response
+
+1. Open TUI immediately:
+   ```bash
+   mx8-tui --coord-url http://coordinator:50051 --job-id affected-job --poll-ms 500
+   ```
+2. Identify stale nodes in runtime panel
+3. Check coordinator panel for lease/progress anomalies
+4. Review manifest panel for specific sample failures
+5. Cross-reference with agent/coordinator logs
+
+## Related
+
+- [Coordinator Reference](/api/cli/coordinator)
+- [Agent Reference](/api/cli/agent)
+- [CLI Overview](/api/cli/overview)

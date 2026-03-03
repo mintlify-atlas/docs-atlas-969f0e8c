@@ -1,0 +1,388 @@
+---
+title: "Video Loader (mx8.video)"
+description: "Clip-based video decode with bounded memory and deterministic sharding"
+---
+
+## Overview
+
+`mx8.video()` delivers decoded video clips with bounded decode and runtime rails. Supports both CLI and FFI decode backends.
+
+## Basic Usage
+
+```python
+import mx8
+
+loader = mx8.video(
+    "s3://bucket/video_prefix/",
+    clip_len=16,
+    stride=8,
+    fps=8,
+    batch_size_samples=32,
+    max_ram_gb=12,
+    profile="balanced",
+)
+
+for batch in loader:
+    clip_ids = batch.clip_ids  # [B] int64
+    payload  = batch.payload   # bytes
+    offsets  = batch.offsets   # [B+1] int64
+```
+
+## Parameters
+
+### Clip Configuration
+
+<ParamField path="clip_len" type="int" required>
+  Number of frames per clip
+</ParamField>
+
+<ParamField path="stride" type="int" required>
+  Step size for clip extraction. Use `stride < clip_len` for overlapping clips.
+</ParamField>
+
+<ParamField path="fps" type="int" required>
+  Target frames per second for decode
+</ParamField>
+
+### Dataset & Memory
+
+<ParamField path="dataset_link" type="str" required>
+  Path or S3 prefix to video dataset
+</ParamField>
+
+<ParamField path="batch_size_samples" type="int" required>
+  Number of clips per batch
+</ParamField>
+
+<ParamField path="max_ram_gb" type="int | float" required>
+  Memory budget
+</ParamField>
+
+<ParamField path="profile" type="str" default="balanced">
+  Safety/throughput preset: `"safe"`, `"balanced"`, or `"throughput"`
+</ParamField>
+
+<ParamField path="autotune" type="bool" default={true}>
+  Enable runtime adaptation loop. Pass `False` to disable.
+</ParamField>
+
+<ParamField path="constraints" type="mx8.Constraints">
+  Override specific cap values (`max_inflight_bytes`, `max_ram_bytes`) while keeping autotune active
+</ParamField>
+
+<ParamField path="manifest_store" type="str" default="~/.mx8/manifests">
+  Manifest store root
+</ParamField>
+
+<ParamField path="manifest_path" type="str">
+  Override with local manifest TSV
+</ParamField>
+
+<ParamField path="recursive" type="bool" default={true}>
+  Index subdirectories recursively
+</ParamField>
+
+### Distributed Execution
+
+<ParamField path="job_id" type="str">
+  Job identifier for distributed mode
+</ParamField>
+
+<ParamField path="cluster_url" type="str">
+  Coordinator URL for distributed attach
+</ParamField>
+
+<ParamField path="node_id" type="str">
+  Node identity for lock-owner during snapshot resolution
+</ParamField>
+
+<ParamField path="resume_from" type="str">
+  Checkpoint token from `loader.checkpoint()`
+</ParamField>
+
+## Usage Patterns
+
+<Tabs>
+  <Tab title="Action Recognition">
+    ```python
+    import mx8
+
+    loader = mx8.video(
+        "s3://bucket/action_videos/",
+        clip_len=16,
+        stride=16,
+        fps=8,
+        batch_size_samples=32,
+        max_ram_gb=24,
+    )
+
+    for batch in loader:
+        # Extract clips
+        clips = []
+        for i in range(len(batch.clip_ids)):
+            clip_bytes = batch.payload[batch.offsets[i]:batch.offsets[i+1]]
+            clips.append(decode_clip(clip_bytes))
+        
+        # Run model
+        predictions = action_model(clips)
+    ```
+  </Tab>
+
+  <Tab title="Overlapping Clips">
+    ```python
+    import mx8
+
+    # 50% overlap for temporal context
+    loader = mx8.video(
+        "s3://bucket/videos/",
+        clip_len=16,
+        stride=8,  # 50% overlap
+        fps=8,
+        batch_size_samples=16,
+        max_ram_gb=24,
+    )
+
+    for batch in loader:
+        process_clips(batch)
+    ```
+  </Tab>
+
+  <Tab title="Distributed Video Loading">
+    ```python
+    import mx8
+
+    loader = mx8.video(
+        "s3://bucket/large_video_dataset/",
+        clip_len=16,
+        stride=16,
+        fps=8,
+        batch_size_samples=32,
+        max_ram_gb=48,
+        job_id="video-train",
+        cluster_url="http://coordinator:50051",
+    )
+
+    for batch in loader:
+        train_step(batch)
+    ```
+  </Tab>
+
+  <Tab title="High FPS Decode">
+    ```python
+    import mx8
+
+    # Higher temporal resolution
+    loader = mx8.video(
+        "s3://bucket/videos/",
+        clip_len=32,
+        stride=32,
+        fps=30,  # 30 fps decode
+        batch_size_samples=16,
+        max_ram_gb=32,
+    )
+
+    for batch in loader:
+        process_high_fps_clips(batch)
+    ```
+  </Tab>
+</Tabs>
+
+## Batch Format
+
+Each batch contains:
+
+- **`clip_ids`**: int64 array of clip identifiers
+- **`sample_ids`**: int64 array of source video sample IDs
+- **`media_uris`**: array of source video URIs
+- **`clip_starts`**: array of clip start offsets
+- **`offsets`**: int64 array of byte offsets (length = `len(clip_ids) + 1`)
+- **`payload`**: raw bytes for all clips concatenated
+
+Batch metadata fields:
+
+- **`frames_per_clip`**: frames per clip (= `clip_len`)
+- **`frame_height`**: frame height in pixels
+- **`frame_width`**: frame width in pixels
+- **`channels`**: number of channels (typically 3 for RGB)
+- **`layout`**: tensor layout (e.g., `"NCHW"`, `"NHWC"`)
+- **`dtype`**: data type (e.g., `"uint8"`, `"float32"`)
+- **`colorspace`**: colorspace (e.g., `"RGB"`, `"BGR"`)
+- **`strides`**: tensor strides
+
+```python
+for batch in loader:
+    print(f"Frames per clip: {batch.frames_per_clip}")
+    print(f"Frame shape: {batch.frame_height}x{batch.frame_width}")
+    print(f"Channels: {batch.channels}")
+    print(f"Layout: {batch.layout}")
+    
+    # Extract individual clips
+    for i in range(len(batch.clip_ids)):
+        clip_bytes = batch.payload[batch.offsets[i]:batch.offsets[i+1]]
+```
+
+## Decode Backend
+
+The default backend uses local `ffmpeg` CLI.
+
+### CLI Backend (Default)
+
+```bash
+# Override ffmpeg binary path
+export MX8_FFMPEG_BIN=/usr/local/bin/ffmpeg
+```
+
+### FFI Backend (Experimental)
+
+To use native FFI decode:
+
+```bash
+export MX8_VIDEO_DECODE_BACKEND=ffi
+```
+
+Requires building with:
+
+```bash
+RUSTFLAGS="--cfg mx8_video_ffi" cargo build --release
+```
+
+If FFI is requested but not compiled, MX8 falls back to CLI and emits a `video_decode_backend_fallback` proof event.
+
+## Stats & Monitoring
+
+```python
+stats = loader.stats()
+
+# Video-specific contract fields
+print(stats["video_layout"])                # "NCHW" or "NHWC"
+print(stats["video_dtype"])                 # "uint8" or "float32"
+print(stats["video_colorspace"])            # "RGB" or "BGR"
+print(stats["video_frames_per_clip"])       # clip_len
+print(stats["video_frame_height"])          # frame height
+print(stats["video_frame_width"])           # frame width
+print(stats["video_channels"])              # 3 for RGB
+print(stats["video_clip_bytes"])            # bytes per clip
+
+# Backend selection
+print(stats["video_decode_backend"])        # "cli" or "ffi"
+
+# Decode counters
+print(stats["video_decode_attempted_clips_total"])
+print(stats["video_decode_succeeded_clips_total"])
+print(stats["video_decode_failed_total"])
+print(stats["video_decode_ms_total"])
+
+# Autotune
+print(stats["video_runtime_autotune_enabled"])
+print(stats["video_runtime_autotune_pressure"])
+print(stats["video_runtime_autotune_adjustments_total"])
+
+# Standard pipeline metrics
+print(stats["delivered_samples_total"])
+print(stats["ram_high_water_bytes"])
+```
+
+## Checkpoint & Resume
+
+```python
+import mx8
+
+loader = mx8.video(
+    "s3://bucket/video_prefix/",
+    clip_len=16,
+    stride=8,
+    fps=8,
+    batch_size_samples=32,
+    max_ram_gb=12,
+)
+
+for step, batch in enumerate(loader):
+    train_step(batch)
+    
+    if step % 1000 == 0:
+        token = loader.checkpoint()
+        save_checkpoint(model, token)
+
+# Resume from checkpoint
+loader = mx8.video(
+    "s3://bucket/video_prefix/",
+    clip_len=16,
+    stride=8,
+    fps=8,
+    resume_from=token,
+)
+```
+
+## Runtime Autotune
+
+Autotune is enabled by default and adapts `max_inflight_bytes` within safe bounds:
+
+```python
+loader = mx8.video(
+    "s3://bucket/videos/",
+    clip_len=16,
+    stride=16,
+    fps=8,
+    batch_size_samples=32,
+    max_ram_gb=24,
+    autotune=True,  # default
+)
+```
+
+To disable autotune:
+
+```python
+loader = mx8.video(
+    "s3://bucket/videos/",
+    clip_len=16,
+    stride=16,
+    fps=8,
+    batch_size_samples=32,
+    max_ram_gb=24,
+    autotune=False,
+)
+```
+
+## Validation & Constraints
+
+The loader rejects invalid cap combinations at init:
+
+```python
+# This will fail if batch_size * bytes_per_clip > max_inflight_bytes
+loader = mx8.video(
+    "s3://bucket/videos/",
+    clip_len=64,  # Large clips
+    fps=30,
+    batch_size_samples=128,  # Large batch
+    max_ram_gb=2,  # Too small
+)
+# Error: batch_size_samples * bytes_per_clip > max_inflight_bytes
+```
+
+## Best Practices
+
+<Check>
+**Match `stride` to `clip_len` for non-overlapping clips** — avoids duplicate processing
+</Check>
+
+<Check>
+**Use overlapping clips (`stride < clip_len`) for temporal smoothness** — improves action recognition
+</Check>
+
+<Check>
+**Monitor `video_decode_failed_total`** — track corrupt or unsupported video files
+</Check>
+
+<Check>
+**Enable autotune for variable video sizes** — adapts memory usage automatically
+</Check>
+
+<Warning>
+**Video decode is compute-intensive** — ensure adequate CPU/GPU resources
+</Warning>
+
+## See Also
+
+- [Byte Loader](/loaders/bytes) - Raw byte streaming
+- [Mix API](/loaders/mix) - Blend multiple video datasets
+- Gate tests: `./scripts/video_stage2b_gate.sh`, `./scripts/video_stage2b_stress_gate.sh`, `./scripts/video_stage2c_perf_gate.sh`, `./scripts/video_stage3a_backend_gate.sh`, `./scripts/video_ga_gate.sh`

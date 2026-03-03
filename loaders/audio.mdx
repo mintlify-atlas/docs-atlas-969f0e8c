@@ -1,0 +1,339 @@
+---
+title: "Audio Loader (mx8.audio)"
+description: "Audio decode pipeline with fixed-shape mono output for speech and audio ML"
+---
+
+## Overview
+
+`mx8.audio()` decodes audio samples in Rust and emits fixed-shape mono tensors for model input. Supports WAV and FLAC formats.
+
+## Basic Usage
+
+```python
+import mx8
+
+loader = mx8.audio(
+    "s3://bucket/audio@refresh",
+    batch_size_samples=32,
+    sample_count=16000,
+    channels=1,
+    sample_rate_hz=16000,
+    decode_error_policy="error",
+    max_ram_gb=12,
+    profile="balanced",
+)
+
+for batch in loader:
+    samples = batch.samples                  # [B, sample_count] float32
+    sample_rates_hz = batch.sample_rates_hz  # [B] int64
+    sample_ids = batch.sample_ids            # [B] int64
+```
+
+## Parameters
+
+### Audio Configuration
+
+<ParamField path="sample_count" type="int" required>
+  Fixed output frame count per emitted row. Short clips are zero-padded; long clips are truncated.
+</ParamField>
+
+<ParamField path="channels" type="int" required>
+  Output channels. `mx8==1.0.5` supports `channels=1` only (mono output).
+</ParamField>
+
+<ParamField path="sample_rate_hz" type="int">
+  Optional strict sample-rate check. When set, samples with mismatched decoded rates follow `decode_error_policy`.
+</ParamField>
+
+<ParamField path="decode_error_policy" type="str" default="error">
+  Decode failure handling:
+  - `"error"`: fail on decode errors or sample-rate mismatches
+  - `"skip"`: skip samples that fail to decode or have wrong sample rate
+</ParamField>
+
+### Dataset & Memory
+
+<ParamField path="dataset_link" type="str" required>
+  Path or S3 prefix to audio dataset
+</ParamField>
+
+<ParamField path="batch_size_samples" type="int" required>
+  Number of audio clips per batch
+</ParamField>
+
+<ParamField path="max_ram_gb" type="int | float" required>
+  Memory budget
+</ParamField>
+
+<ParamField path="profile" type="str" default="balanced">
+  Safety/throughput preset: `"safe"`, `"balanced"`, or `"throughput"`
+</ParamField>
+
+<ParamField path="manifest_store" type="str" default="~/.mx8/manifests">
+  Manifest store root
+</ParamField>
+
+<ParamField path="manifest_path" type="str">
+  Override with local manifest TSV
+</ParamField>
+
+<ParamField path="recursive" type="bool" default={true}>
+  Index subdirectories recursively
+</ParamField>
+
+<ParamField path="start_id" type="int">
+  Starting sample ID
+</ParamField>
+
+<ParamField path="end_id" type="int">
+  Ending sample ID (exclusive)
+</ParamField>
+
+<ParamField path="autopack" type="bool" default={false}>
+  Auto-pack if no manifest exists
+</ParamField>
+
+<ParamField path="autopack_shard_mb" type="int" default={512}>
+  Shard size for auto-packing
+</ParamField>
+
+### Distributed Execution
+
+<ParamField path="job_id" type="str">
+  Job identifier for distributed mode
+</ParamField>
+
+<ParamField path="cluster_url" type="str">
+  Coordinator URL
+</ParamField>
+
+<ParamField path="resume_from" type="str">
+  Checkpoint token from `loader.checkpoint()`
+</ParamField>
+
+## Usage Patterns
+
+<Tabs>
+  <Tab title="Speech Recognition">
+    ```python
+    import mx8
+
+    loader = mx8.audio(
+        "s3://bucket/speech/",
+        batch_size_samples=32,
+        sample_count=16000,  # 1 second at 16kHz
+        channels=1,
+        sample_rate_hz=16000,
+        max_ram_gb=12,
+    )
+
+    for batch in loader:
+        audio = batch.samples  # [32, 16000] float32
+        transcriptions = asr_model(audio)
+    ```
+  </Tab>
+
+  <Tab title="Audio Classification">
+    ```python
+    import mx8
+
+    loader = mx8.audio(
+        "s3://bucket/audio_events/",
+        batch_size_samples=64,
+        sample_count=44100,  # 1 second at 44.1kHz
+        channels=1,
+        sample_rate_hz=44100,
+        max_ram_gb=12,
+    )
+
+    for batch in loader:
+        audio = batch.samples  # [64, 44100] float32
+        labels = classify(audio)
+    ```
+  </Tab>
+
+  <Tab title="Variable Sample Rates">
+    ```python
+    import mx8
+
+    # Don't enforce sample rate check
+    loader = mx8.audio(
+        "s3://bucket/mixed_audio/",
+        batch_size_samples=32,
+        sample_count=16000,
+        channels=1,
+        # sample_rate_hz not set
+        max_ram_gb=12,
+    )
+
+    for batch in loader:
+        audio = batch.samples              # [32, 16000] float32
+        rates = batch.sample_rates_hz      # [32] int64
+        
+        # Handle different sample rates
+        for i, rate in enumerate(rates):
+            if rate != 16000:
+                audio[i] = resample(audio[i], rate, 16000)
+    ```
+  </Tab>
+
+  <Tab title="Skip Decode Errors">
+    ```python
+    import mx8
+
+    # Skip corrupt or incompatible files
+    loader = mx8.audio(
+        "s3://bucket/noisy_dataset/",
+        batch_size_samples=32,
+        sample_count=16000,
+        channels=1,
+        sample_rate_hz=16000,
+        decode_error_policy="skip",  # Skip bad files
+        max_ram_gb=12,
+    )
+
+    for batch in loader:
+        audio = batch.samples
+        train_step(audio)
+    ```
+  </Tab>
+
+  <Tab title="Long Audio Clips">
+    ```python
+    import mx8
+
+    # 10 seconds of audio at 16kHz
+    loader = mx8.audio(
+        "s3://bucket/long_audio/",
+        batch_size_samples=16,
+        sample_count=160000,  # 10 seconds
+        channels=1,
+        sample_rate_hz=16000,
+        max_ram_gb=24,
+    )
+
+    for batch in loader:
+        audio = batch.samples  # [16, 160000] float32
+        process_long_audio(audio)
+    ```
+  </Tab>
+</Tabs>
+
+## Batch Format
+
+Each batch contains:
+
+- **`samples`**: `[B, sample_count]` float32 tensor of audio samples
+- **`sample_rates_hz`**: `[B]` int64 array of decoded sample rates
+- **`sample_ids`**: `[B]` int64 array of source sample identifiers
+
+```python
+for batch in loader:
+    print(batch.samples.shape)          # (32, 16000)
+    print(batch.sample_rates_hz.shape)  # (32,)
+    print(batch.sample_ids.shape)       # (32,)
+```
+
+## Padding & Truncation
+
+- **Short clips**: Zero-padded to `sample_count`
+- **Long clips**: Truncated to `sample_count`
+
+```python
+loader = mx8.audio(
+    "s3://bucket/audio/",
+    sample_count=16000,  # 1 second at 16kHz
+    channels=1,
+    batch_size_samples=32,
+    max_ram_gb=12,
+)
+
+# File with 8000 frames  → padded to 16000 (8000 zeros appended)
+# File with 32000 frames → truncated to 16000
+```
+
+## Supported Formats
+
+`mx8==1.0.5` supports:
+
+- **WAV** (uncompressed PCM)
+- **FLAC** (lossless compression)
+
+Other formats will trigger decode errors (fail or skip based on `decode_error_policy`).
+
+## Stats & Monitoring
+
+```python
+stats = loader.stats()
+
+# Audio-specific metrics
+print(stats["audio_sample_count"])              # 16000
+print(stats["audio_channels"])                  # 1
+print(stats["audio_expected_sample_rate_hz"])   # 16000 or None
+print(stats["audio_decode_samples_total"])      # Total samples decoded
+print(stats["audio_decode_failures_total"])     # Decode failures
+print(stats["audio_decoded_frames_total"])      # Total frames decoded
+
+# Standard pipeline metrics
+print(stats["delivered_samples_total"])
+print(stats["ram_high_water_bytes"])
+```
+
+## Checkpoint & Resume
+
+```python
+import mx8
+
+loader = mx8.audio(
+    "s3://bucket/audio/",
+    batch_size_samples=32,
+    sample_count=16000,
+    channels=1,
+    max_ram_gb=12,
+)
+
+for step, batch in enumerate(loader):
+    train_step(batch.samples)
+    
+    if step % 1000 == 0:
+        token = loader.checkpoint()
+        save_checkpoint(model, token)
+
+# Resume from checkpoint
+loader = mx8.audio(
+    "s3://bucket/audio/",
+    batch_size_samples=32,
+    sample_count=16000,
+    channels=1,
+    max_ram_gb=12,
+    resume_from=token,
+)
+```
+
+## Best Practices
+
+<Check>
+**Set `sample_rate_hz` for strict sample-rate validation** — catches mismatched files early
+</Check>
+
+<Check>
+**Use `decode_error_policy="skip"` for noisy datasets** — prevents training interruption from bad files
+</Check>
+
+<Check>
+**Match `sample_count` to your model's expected input length** — avoids unnecessary padding or truncation
+</Check>
+
+<Check>
+**Monitor `audio_decode_failures_total`** — track data quality issues
+</Check>
+
+<Warning>
+**Only mono output is supported** — `channels=1` is required in `mx8==1.0.5`
+</Warning>
+
+## See Also
+
+- [Byte Loader](/loaders/bytes) - Raw byte streaming
+- [Mix API](/loaders/mix) - Blend multiple audio datasets
+- Gate test: `./scripts/audio_gate.sh`

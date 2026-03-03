@@ -1,0 +1,277 @@
+---
+title: Coordinator Environment Variables
+description: Configuration reference for the MX8 coordinator process
+---
+
+## Overview
+
+The coordinator runs the job control plane, managing leases, dataset ownership, and agent heartbeats. It binds a gRPC port (default `0.0.0.0:50051`) and serves control-plane traffic only—it never proxies dataset data bytes.
+
+## Network Configuration
+
+<ParamField path="MX8_COORD_BIND_ADDR" type="string" default="0.0.0.0:50051">
+  gRPC bind address for the coordinator service.
+  
+  Format: `<host>:<port>` (e.g., `0.0.0.0:50051`, `127.0.0.1:8080`)
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_GRPC_MAX_MESSAGE_BYTES" type="integer" default="67108864">
+  Maximum gRPC message size in bytes (64MB default).
+  
+  **Must match** the same setting on all agents and clients.
+  
+  **Stability**: `stable`
+</ParamField>
+
+## World Membership
+
+<ParamField path="MX8_WORLD_SIZE" type="integer" default="1">
+  Total number of agents in the job. The coordinator waits for this many agents to join before starting work distribution.
+  
+  Set explicitly in production—do not rely on the default.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_MIN_WORLD_SIZE" type="integer" default="0">
+  Minimum number of agents required before the coordinator starts. If set to `0`, defaults to `MX8_WORLD_SIZE`.
+  
+  Useful for testing partial deployments.
+  
+  **Stability**: `stable`
+</ParamField>
+
+## Dataset and Manifest Store
+
+<ParamField path="MX8_DATASET_LINK" type="string" default="unset">
+  Dataset reference path. Supports three formats:
+  
+  - **Plain path/prefix**: `s3://bucket/dataset` (not recommended for production)
+  - **Auto-refresh**: `s3://bucket/dataset/@refresh` (resolves latest manifest)
+  - **Pinned hash**: `s3://bucket/dataset/@sha256:<hash>` (immutable reference)
+  
+  **Production**: Always use `@refresh` or `@sha256:<hash>` suffix.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_MANIFEST_STORE_ROOT" type="string" default="~/.mx8/manifests">
+  Root path for manifest storage. Can be a filesystem path or S3/Azure/GCS prefix.
+  
+  Examples:
+  - `~/.mx8/manifests` (local filesystem)
+  - `s3://bucket/manifests/` (S3)
+  - `az://container/manifests/` (Azure Blob)
+  - `gs://bucket/manifests/` (GCS)
+  
+  **Production**: Use durable S3 or shared storage, not local ephemeral disk.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_MANIFEST_HASH" type="string" default="dev">
+  Legacy pinned manifest hash path. Use `MX8_DATASET_LINK` with `@sha256:` suffix instead.
+  
+  **Stability**: `stable` (deprecated)
+</ParamField>
+
+## Heartbeat and Lease Timing
+
+<ParamField path="MX8_HEARTBEAT_INTERVAL_MS" type="integer" default="1000">
+  Heartbeat cadence (in milliseconds) returned to agents.
+  
+  Agents report progress and renew leases at this interval.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_LEASE_TTL_MS" type="integer" default="10000">
+  Time-to-live (in milliseconds) for agent leases before expiry.
+  
+  If an agent stops heartbeating for this duration, the coordinator requeues the unfinished range.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_LEASE_LOG_PATH" type="string" default="<manifest_store_root>/../lease_logs/<manifest_hash>.log">
+  Write-ahead log path for lease state replay.
+  
+  Set to `none` to disable lease logging (not recommended for production).
+  
+  **Stability**: `stable`
+</ParamField>
+
+## High Availability (HA)
+
+<ParamField path="MX8_COORD_HA_ENABLE" type="boolean" default="true">
+  Enable leader-fencing mode using a shared lease file.
+  
+  Multiple coordinator instances can run; only one becomes leader.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_COORD_HA_LEASE_PATH" type="string" default="<manifest_store_root>/../ha/<manifest_hash>.leader_lease">
+  Shared leader lease file path for coordinator HA.
+  
+  All coordinator candidates must share this path.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_COORD_HA_LEADER_ID" type="string" default="<hostname>-<pid>">
+  Coordinator identity for HA lease records.
+  
+  Defaults to `<hostname>-<pid>` for uniqueness.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_COORD_HA_LEASE_TTL_MS" type="integer" default="5000">
+  Leader lease TTL in milliseconds.
+  
+  If a leader fails to renew within this window, another coordinator can take over.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_COORD_HA_RENEW_INTERVAL_MS" type="integer" default="1000">
+  Leader lease renewal cadence in milliseconds.
+  
+  **Stability**: `stable`
+</ParamField>
+
+## Durable State Store
+
+<ParamField path="MX8_COORD_STATE_STORE_ENABLE" type="boolean" default="true">
+  Enable shared state snapshots for coordinator recovery.
+  
+  When enabled, the coordinator writes periodic state snapshots to a shared file.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_COORD_STATE_STORE_PATH" type="string" default="<manifest_store_root>/../state/<manifest_hash>.json">
+  Shared state snapshot file path.
+  
+  All coordinator candidates must share this path for recovery.
+  
+  **Stability**: `stable`
+</ParamField>
+
+## Snapshot and Indexing
+
+<ParamField path="MX8_SNAPSHOT_LOCK_STALE_MS" type="integer" default="60000">
+  Stale threshold (in milliseconds) for snapshot locks.
+  
+  If a snapshot lock is older than this, it's considered abandoned.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_SNAPSHOT_WAIT_TIMEOUT_MS" type="integer" default="30000">
+  Maximum wait time (in milliseconds) for a concurrent indexer to finish.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_SNAPSHOT_S3_EXTERNAL_SORT" type="boolean" default="false">
+  Enable external merge-sort for large S3 dataset indexing.
+  
+  Reduces memory usage for massive datasets by spilling keys to disk.
+  
+  **Stability**: `experimental`
+</ParamField>
+
+<ParamField path="MX8_SNAPSHOT_S3_SPILL_KEYS_PER_RUN" type="integer" default="100000">
+  Number of keys per external sort run when `MX8_SNAPSHOT_S3_EXTERNAL_SORT=true`.
+  
+  **Stability**: `experimental`
+</ParamField>
+
+## Deterministic Ordering
+
+<ParamField path="MX8_SHUFFLE" type="boolean" default="false">
+  Enable deterministic block shuffle.
+  
+  When enabled, work blocks are shuffled using `MX8_SEED` and `MX8_EPOCH`.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_SEED" type="integer" default="0">
+  Shuffle seed for deterministic ordering.
+  
+  Type: `u64`
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_EPOCH" type="integer" default="0">
+  Epoch input for deterministic ordering.
+  
+  Type: `u32`
+  
+  **Stability**: `stable`
+</ParamField>
+
+## Dev and Testing
+
+<ParamField path="MX8_DEV_MANIFEST_PATH" type="string" default="unset">
+  Path to a dev manifest bootstrap file for local testing.
+  
+  **Stability**: `stable` (dev-only)
+</ParamField>
+
+<ParamField path="MX8_DEV_TOTAL_SAMPLES" type="integer" default="0">
+  Synthetic sample count for dev-only testing (no real manifest).
+  
+  **Stability**: `stable` (dev-only)
+</ParamField>
+
+<ParamField path="MX8_DEV_BLOCK_SIZE" type="integer" default="65536">
+  Work-range block size for dev-only synthetic datasets.
+  
+  **Stability**: `stable` (dev-only)
+</ParamField>
+
+## Metrics and Observability
+
+<ParamField path="MX8_METRICS_SNAPSHOT_INTERVAL_MS" type="integer" default="0">
+  Periodic metrics logging interval in milliseconds.
+  
+  Set to `0` to disable. Non-zero enables periodic metrics snapshots.
+  
+  **Stability**: `stable`
+</ParamField>
+
+## Example Configuration
+
+<CodeGroup>
+```bash Production
+MX8_COORD_BIND_ADDR='0.0.0.0:50051' \
+MX8_WORLD_SIZE=8 \
+MX8_DATASET_LINK='s3://your-bucket/dataset/@refresh' \
+MX8_MANIFEST_STORE_ROOT='s3://your-bucket/manifests/' \
+MX8_GRPC_MAX_MESSAGE_BYTES=67108864 \
+MX8_COORD_HA_ENABLE=true \
+MX8_COORD_STATE_STORE_ENABLE=true \
+target/release/mx8-coordinator
+```
+
+```bash Local Dev
+MX8_COORD_BIND_ADDR='127.0.0.1:50051' \
+MX8_WORLD_SIZE=1 \
+MX8_DEV_MANIFEST_PATH='./manifest.tsv' \
+MX8_MANIFEST_STORE_ROOT='~/.mx8/manifests' \
+cargo run -p mx8-coordinator
+```
+</CodeGroup>
+
+## Related Resources
+
+- [Agent Variables](/api/env/agent) - Agent-specific configuration
+- [Runtime Variables](/api/env/runtime) - Runtime and performance tuning
+- [Deployment Guide](/guides/deployment) - Step-by-step coordinator deployment

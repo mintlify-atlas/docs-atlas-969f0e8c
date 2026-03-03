@@ -1,0 +1,208 @@
+---
+title: Agent Environment Variables
+description: Configuration reference for MX8 agent processes
+---
+
+## Overview
+
+Each agent runs on one node and connects to the coordinator for leases, heartbeats, and progress reporting. Agents enforce local memory caps and feed work ranges to runtimes on that machine.
+
+## Coordinator Connection
+
+<ParamField path="MX8_COORD_URL" type="string" default="http://127.0.0.1:50051">
+  Coordinator gRPC address.
+  
+  Format: `http://<host>:<port>` (e.g., `http://coordinator-host:50051`)
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_GRPC_MAX_MESSAGE_BYTES" type="integer" default="67108864">
+  Maximum gRPC message size in bytes (64MB default).
+  
+  **Must match** the coordinator's `MX8_GRPC_MAX_MESSAGE_BYTES` setting.
+  
+  **Stability**: `stable`
+</ParamField>
+
+## Job Identity
+
+<ParamField path="MX8_JOB_ID" type="string" default="local-job">
+  Job identifier. Must match the coordinator's job.
+  
+  Each agent must use the same `MX8_JOB_ID` to join the same job.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_NODE_ID" type="string" default="local-node">
+  Stable identity for this node.
+  
+  Used for lease tracking and recovery. Must be unique per agent and persistent across restarts.
+  
+  **Stability**: `stable`
+</ParamField>
+
+## Batch Configuration
+
+<ParamField path="MX8_BATCH_SIZE_SAMPLES" type="integer" default="512">
+  Number of samples per batch delivered to the runtime.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_TARGET_BATCH_BYTES" type="integer" default="unset">
+  Optional target byte size per batch.
+  
+  If set, batches will aim for this byte target (but may be smaller or larger based on sample sizes).
+  
+  Must be `<= MX8_MAX_BATCH_BYTES` if both are set.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_MAX_BATCH_BYTES" type="integer" default="unset">
+  Hard byte cap per batch.
+  
+  If set, batches will never exceed this size.
+  
+  Must be `<= MX8_MAX_INFLIGHT_BYTES`.
+  
+  **Stability**: `stable`
+</ParamField>
+
+## Pipeline and Memory
+
+<ParamField path="MX8_PREFETCH_BATCHES" type="integer" default="1">
+  Number of batches to prefetch (read-ahead depth).
+  
+  Higher values improve throughput but increase memory usage.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_MAX_QUEUE_BATCHES" type="integer" default="64">
+  Maximum number of batches in the delivered queue.
+  
+  Acts as backpressure when the consumer is slower than the pipeline.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_MAX_INFLIGHT_BYTES" type="integer" default="134217728">
+  Pipeline byte budget in bytes (128MB default).
+  
+  Total bytes allowed in flight across all prefetch stages.
+  
+  **Stability**: `stable`
+</ParamField>
+
+<ParamField path="MX8_MAX_PROCESS_RSS_BYTES" type="integer" default="unset">
+  Whole-process RSS fail-fast cap in bytes.
+  
+  If set, the agent will terminate if the process RSS exceeds this limit.
+  
+  **Production**: Set as an org-wide policy default, not per-job ad-hoc.
+  
+  **Stability**: `stable`
+</ParamField>
+
+## Progress Reporting
+
+<ParamField path="MX8_PROGRESS_INTERVAL_MS" type="integer" default="500">
+  How often (in milliseconds) to report cursor progress to the coordinator.
+  
+  **Stability**: `stable`
+</ParamField>
+
+## Manifest Streaming
+
+<ParamField path="MX8_AGENT_MANIFEST_STREAM_MAX_LINE_BYTES" type="integer" default="8388608">
+  Maximum line length (in bytes) when streaming manifest chunks from the coordinator.
+  
+  Default: 8MB
+  
+  Increase only if you have exceptionally wide manifest rows.
+  
+  **Stability**: `experimental`
+</ParamField>
+
+## Dev and Testing
+
+<ParamField path="MX8_DEV_LEASE_WANT" type="integer" default="0">
+  Dev-only continuous lease loop.
+  
+  Set to a non-zero value to enable a dev mode where the agent continuously requests leases (useful for testing lease distribution).
+  
+  **Stability**: `experimental`
+</ParamField>
+
+<ParamField path="MX8_SINK_SLEEP_MS" type="integer" default="0">
+  Dev-only artificial delivery delay in milliseconds.
+  
+  Simulates a slow consumer by sleeping after each batch delivery.
+  
+  **Stability**: `stable` (dev-only)
+</ParamField>
+
+## Metrics and Observability
+
+<ParamField path="MX8_METRICS_SNAPSHOT_INTERVAL_MS" type="integer" default="0">
+  Periodic agent metrics log snapshot interval in milliseconds.
+  
+  Set to `0` to disable. Non-zero enables periodic metrics logging.
+  
+  **Stability**: `stable`
+</ParamField>
+
+## Example Configuration
+
+<CodeGroup>
+```bash Production
+MX8_COORD_URL='http://coordinator-host:50051' \
+MX8_JOB_ID='prod-job-001' \
+MX8_NODE_ID='node-0' \
+MX8_BATCH_SIZE_SAMPLES=512 \
+MX8_PREFETCH_BATCHES=2 \
+MX8_MAX_INFLIGHT_BYTES=134217728 \
+MX8_MAX_PROCESS_RSS_BYTES=68719476736 \
+MX8_GRPC_MAX_MESSAGE_BYTES=67108864 \
+target/release/mx8d-agent
+```
+
+```bash Local Dev
+MX8_COORD_URL='http://127.0.0.1:50051' \
+MX8_JOB_ID='local-job' \
+MX8_NODE_ID='local-node' \
+MX8_BATCH_SIZE_SAMPLES=64 \
+MX8_MAX_INFLIGHT_BYTES=67108864 \
+cargo run -p mx8d-agent
+```
+</CodeGroup>
+
+## Failure and Restart
+
+When an agent dies or stops heartbeating:
+
+1. The coordinator waits for `MX8_LEASE_TTL_MS` (default 10 seconds)
+2. Unfinished range `[cursor, end)` is requeued
+3. Other agents pick up the work
+
+To restart a failed agent:
+
+```bash
+# Use the SAME MX8_JOB_ID and MX8_NODE_ID
+MX8_COORD_URL='http://coordinator-host:50051' \
+MX8_JOB_ID='prod-job-001' \
+MX8_NODE_ID='node-0' \
+target/release/mx8d-agent
+```
+
+Verify in the TUI that heartbeats resume and the requeued range is picked up.
+
+## Related Resources
+
+- [Coordinator Variables](/api/env/coordinator) - Coordinator configuration
+- [Runtime Variables](/api/env/runtime) - Runtime and performance tuning
+- [Deployment Guide](/guides/deployment) - Step-by-step agent deployment
+- [Production Runbook](/operations/production-runbook) - Failure recovery procedures
