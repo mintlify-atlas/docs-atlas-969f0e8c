@@ -1,0 +1,126 @@
+{
+  "projectType": "data-platform",
+  "projectName": "MX8",
+  "projectDescription": "High-performance Rust data runtime for large-scale ML workloads with bounded memory and distributed coordination",
+  "theme": "aspen",
+  "primaryColor": "#FF6B35",
+  "lightColor": "#FFB088",
+  "darkColor": "#CC5529",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/memory-contract",
+              "concepts/manifests-and-snapshots",
+              "concepts/distributed-execution"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/user-guide",
+              "guides/deployment",
+              "guides/packing-datasets",
+              "guides/multi-epoch-training",
+              "guides/monitoring"
+            ]
+          },
+          {
+            "group": "Data Loaders",
+            "pages": [
+              "loaders/overview",
+              "loaders/bytes",
+              "loaders/text",
+              "loaders/image",
+              "loaders/audio",
+              "loaders/video",
+              "loaders/mix"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/production-runbook",
+              "operations/troubleshooting",
+              "operations/high-availability",
+              "operations/security"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Python API",
+            "pages": [
+              "api/python/overview",
+              "api/python/loaders",
+              "api/python/packing",
+              "api/python/stats",
+              "api/python/checkpoint"
+            ]
+          },
+          {
+            "group": "CLI Tools",
+            "pages": [
+              "api/cli/overview",
+              "api/cli/coordinator",
+              "api/cli/agent",
+              "api/cli/tui"
+            ]
+          },
+          {
+            "group": "Environment Variables",
+            "pages": [
+              "api/env/overview",
+              "api/env/coordinator",
+              "api/env/agent",
+              "api/env/runtime"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Bounded memory with fail-fast RSS caps",
+    "Zero-manifest loading from raw S3 prefixes",
+    "Deterministic replay via pinned manifest_hash",
+    "Recovery-oriented distributed lease model",
+    "Multi-modal data loaders (text, image, audio, video)",
+    "High-availability coordinator with leader fencing",
+    "Durable lease log for crash recovery",
+    "Dynamic membership with elastic scale-out"
+  ],
+  "publicApiSurface": [
+    "mx8.load()",
+    "mx8.text()",
+    "mx8.image()",
+    "mx8.audio()",
+    "mx8.video()",
+    "mx8.mix()",
+    "mx8.pack()",
+    "mx8.pack_dir()",
+    "mx8.resolve_manifest_hash()",
+    "mx8.stats()",
+    "loader.checkpoint()",
+    "loader.stats()",
+    "mx8-coordinator",
+    "mx8d-agent",
+    "mx8-tui"
+  ]
+}
